@@ -6,6 +6,12 @@ import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
+import com.nvidia.bloom.CloudManager
+import com.nvidia.bloom.KubernetesManager
+import com.nvidia.bloom.SlurmConfig
+import com.nvidia.bloom.SlurmCluster
+import com.nvidia.bloom.SlurmPartition
+import com.nvidia.bloom.Utils
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -78,6 +84,121 @@ TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
+
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
+    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def remote = [
+            ip           : cluster.ip,
+            host         : cluster.host,
+            user         : "${pipeline.USERNAME}",
+            passwd       : "${pipeline.PASSWORD}",
+            password     : "${pipeline.PASSWORD}",
+            allowAnyHosts: true,
+        ]
+
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+        pipeline.stage('Clean up SLURM Agent Resources') {
+            Utils.exec(
+                pipeline,
+                timeout: false,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
+                )
+            )
+            Utils.exec(pipeline, script: "echo done")
+        }
+    }
+}
+
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+{
+    runner {
+        // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
+        cacheErrorAndUploadResult(stageName, {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+        }, {
+            // If the execution test list is null, remove the test result xml
+            sh """
+                ls -all ${stageName}/
+                if ! grep -q '<testcase' ${stageName}/results.xml; then
+                    rm ${stageName}/results.xml
+                fi
+            """
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
+            // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
+            sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
+            sh "ls -all ${llmSrc}/cpp/build/ || true"
+            // Sed for CPP test result
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Sed for Pytest result
+            sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Copy CPP test result
+            sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
+            sh "ls ${stageName}/ -all"
+        })
+    }
+}
+
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+{
+    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
+    def nodeSecret = CloudManager.createNode(nodeName)
+
+    try {
+        // Run ssh command to start node in desired cluster via SLURM
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            def remote = [
+                    ip           : cluster.ip,
+                    host         : cluster.host,
+                    user         : "${pipeline.USERNAME}",
+                    passwd       : "${pipeline.PASSWORD}",
+                    password     : "${pipeline.PASSWORD}",
+                    allowAnyHosts: true,
+            ]
+
+            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+            stage('Request Node via SLURM') {
+                println("Selected Cluster: ${cluster.name}")
+
+                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, "slurm_jenkins_agent_setup.sh")
+
+                Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
+
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
+
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                            remote,
+                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
+                    )
+                )
+                Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
+            }
+        }
+
+        if (!CloudManager.isNodeOnline(nodeName)){
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                error "Cannot find a node that is idle to run the test for ${stageName}"
+            }
+        }
+
+        // TODO: pass in the gpu numbers instead of hard code it to 1
+        def dockerArgs = "--gpus 1 --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+    } finally {
+        cleanUpNodeResources(pipeline, cluster, nodeName)
+        CloudManager.destroyNode(nodeName)
+    }
+}
 
 def trimForStageList(stageNameList)
 {
@@ -723,10 +844,125 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
+    if (!fileExists("${WORKSPACE}/${stageName}/results.xml")) {
+        error "There is not results.xml file, skip the rerun step"
+    }
+
+    // Generate rerun test lists
+    def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        generate_rerun_tests_list \
+        --output-dir=${WORKSPACE}/${stageName}/ \
+        --input-file=${WORKSPACE}/${stageName}/results.xml \
+        --fail-signatures='${failSignaturesList}'
+    """
+
+    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
+    // fail the stage immediately without attempting any reruns
+    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    if (fileExists(rerunTestList)) {
+        sh "cat ${rerunTestList}"
+        error "There are some failed tests that cannot be rerun, skip the rerun step."
+    }
+
+    // If the stage has more than 5 failed tests, skip the rerun step
+    def validLineCount = 0
+    for (times in [1, 2]) {
+        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(rerunTestList)) {
+            count = sh(
+                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                returnStdout: true
+            ).trim().toInteger()
+            echo "Found ${count} tests to rerun ${times} time(s)"
+            validLineCount += count
+        }
+    }
+    if (validLineCount > 5) {
+        error "There are more than 5 failed tests, skip the rerun step."
+    }
+
+    // Rerun tests
+    isRerunFailed = false
+    for (times in [1, 2]) {
+        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (!fileExists(rerunTestList)) {
+            echo "No failed tests need to be rerun ${times} time(s)"
+            continue
+        }
+        sh "cat ${rerunTestList}"
+        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        testCmdLine = [
+            "LLM_ROOT=${llmSrc}",
+            "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+            extraInternalEnv,
+            "pytest",
+            "-v",
+            "--timeout=${pytestTestTimeout}",
+            "--rootdir ${llmSrc}/tests/integration/defs",
+            "--test-prefix=${stageName}",
+            "--test-list=${rerunTestList}",
+            "--output-dir=${WORKSPACE}/${stageName}/",
+            "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
+            "--junit-xml ${xmlFile}",
+            "-o junit_logging=out-err",
+            "--reruns ${times - 1}"
+        ]
+        try {
+            sh """
+                cd ${llmSrc}/tests/integration/defs && \
+                ${testCmdLine.join(" ")}
+            """
+        } catch(InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            if (!fileExists(xmlFile)) {
+                echo "The tests crashed when rerun attempt."
+                throw e
+            }
+            echo "The tests still failed after rerun attempt."
+            isRerunFailed = true
+        }
+    }
+
+    // generate rerun report
+    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        generate_rerun_report \
+        --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
+        --input-files=${inputFiles.join(",")}
+    """
+
+    // Update original results xml file with rerun results xml files for junit
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        merge_junit_xmls \
+        --output-file=${WORKSPACE}/${stageName}/results.xml \
+        --input-files=${inputFiles.join(",")} \
+        --deduplicate
+    """
+
+    trtllm_utils.uploadArtifacts(
+        "${WORKSPACE}/${stageName}/rerun_results.html",
+        "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    )
+
+    echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    return isRerunFailed
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     // Step 1: create LLM_ROOT dir
     sh "pwd && ls -alh"
+    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
+    // So that it can work with multiple job running in same node
+    sh "rm -rf ./*"
     def llmRootConfig = "${LLM_ROOT}${config}"
     sh "mkdir ${llmRootConfig}"
 
@@ -935,16 +1171,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                trtllm_utils.llmExecStepWithRetry(
-                    pipeline,
-                    numRetries: 1,
-                    script: """
+                try {
+                    sh """
                         rm -rf ${stageName}/ && \
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
-                    """,
-                    retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
-                )
+                    """
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
+                    if (isRerunFailed) {
+                        echo "The tests still failed after rerun attempt."
+                        throw e
+                    }
+                }
             }
         }
 
@@ -1179,6 +1420,24 @@ def checkStageName(stageNames) {
     }
 }
 
+// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
+def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
+{
+    return {
+        runner -> node(label) {
+            if (needToDeleteDir) {
+                deleteDir()
+            }
+            stage('Pull Docker Image') {
+                docker.image(image).pull()
+            }
+            docker.image(image).inside(dockerArgs) {
+                runner()
+            }
+        }
+    }
+}
+
 def runInDockerOnNode(image, label, dockerArgs)
 {
     return {
@@ -1289,6 +1548,25 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     fullSet = parallelJobs.keySet()
+
+    turtleSlurmConfigs = [
+        "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+    ]
+
+    // TODO: use cpu pod to launch slurm job
+    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
+    def config = VANILLA_CONFIG
+        if (key.contains("single-device")) {
+            config = SINGLE_DEVICE_CONFIG
+        }
+        if (key.contains("llvm")) {
+            config = LLVM_CONFIG
+        }
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
+    }]]}
+
+    fullSet += parallelSlurmJobs.keySet()
+    parallelJobs += parallelSlurmJobs
 
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.

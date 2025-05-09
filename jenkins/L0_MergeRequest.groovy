@@ -450,6 +450,12 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file list to empty list.")
+        return []
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
 
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
@@ -473,6 +479,11 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     def autoTriggerTagList = []
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set auto trigger tags to empty list.")
+        return autoTriggerTagList
+    }
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
         return autoTriggerTagList
@@ -672,6 +683,44 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Rerun report") {
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+            if (rerunFileCount == 0) {
+                echo "Rerun report is skipped because there is no rerun test data file."
+                return
+            }
+            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+            def xmlFileList = xmlFiles.collect { it.path }
+            def inputfiles = xmlFileList.join(',')
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                --output-file=rerun/rerun_report.xml \
+                --input-files=${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+                catchError(
+                    buildResult: 'FAILURE',
+                    stageResult: 'FAILURE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } else {
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            }
+        } // Rerun report stage
         try {
             stage("Test coverage") {
                 sh "ls"
@@ -1024,6 +1073,9 @@ pipeline {
                             }
                         }
                     } else {
+                        // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
+                        // Reset it to null to workaround the "Argument list too long" error
+                        globalVars[CACHED_CHANGED_FILE_LIST] = null
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
