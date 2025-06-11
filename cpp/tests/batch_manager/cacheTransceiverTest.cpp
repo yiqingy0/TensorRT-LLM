@@ -420,7 +420,7 @@ protected:
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         if (isSender)
         {
-            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+            auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 // fill cache with tokens (= request length), for reuse test
@@ -433,7 +433,7 @@ protected:
             auto future = mRequester->requestAndReceiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+            auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 std::vector<uint8_t> bytes(block.getSizeInBytes());
@@ -606,16 +606,24 @@ protected:
         ASSERT_EQ(numLayers % mPpSize, 0);
         if (!isMLA)
         {
-            ASSERT_EQ(numHeads % mTpSize, 0);
+            // ASSERT_EQ(numHeads % mTpSize , 0);
+            ASSERT_TRUE(numHeads % mTpSize == 0 || mTpSize % numHeads == 0);
         }
         else
         {
             ASSERT_EQ(numHeads, 1);
         }
-        int numHeadsPerRank = numHeads / mTpSize;
+        int numHeadsPerRank = (numHeads + mTpSize - 1) / mTpSize;
+        mDuplicateHeadFactor = 1;
+        if (mTpSize > numHeads)
+        {
+            mDuplicateHeadFactor = mTpSize / numHeads;
+            ASSERT_EQ(numHeadsPerRank, 1);
+        }
         if (isMLA || enableDPAttention)
         {
             numHeadsPerRank = numHeads;
+            mDuplicateHeadFactor = 1;
         }
         auto hiddenSize = numHeadsPerRank * sizePerHead;
         auto maxBlocksPerSeq = 10;
@@ -656,7 +664,7 @@ protected:
             DPsize = mTpSize;
         }
 
-        int numHeadsPerRankForContext = numHeads / mContextTpSize;
+        int numHeadsPerRankForContext = (numHeads + mContextTpSize - 1) / mContextTpSize;
         if (isMLA || mContextDP)
         {
             numHeadsPerRankForContext = numHeads;
@@ -806,7 +814,7 @@ protected:
         }
         else
         {
-            TLLM_CHECK(false);
+            TLLM_CHECK_WITH_INFO(false, "Please set at least one cache transfer backend");
         }
     }
 
@@ -851,7 +859,7 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
         for (auto& block : blockRange)
         {
@@ -887,7 +895,7 @@ protected:
 
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
-        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         for (auto& block : blockRange)
         {
             verifyBlockData(block, blockIdx, llmRequest->getPromptLen());
@@ -906,7 +914,7 @@ protected:
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
-        int startHeadId = headSizePerRank * mTpRank;
+        int startHeadId = headSizePerRank * (mTpRank / mDuplicateHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
@@ -970,7 +978,7 @@ protected:
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
-        int startHeadId = headSizePerRank * mTpRank;
+        int startHeadId = headSizePerRank * (mTpRank / mDuplicateHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
@@ -1063,6 +1071,7 @@ protected:
     bool mContextDP{false};
     bool mGenerationDP{false};
     bool mIsMLA{false};
+    int mDuplicateHeadFactor{1};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
@@ -1203,7 +1212,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         int requestId = 0;
         for (auto len : {30, 10, 60, 30, 60, 10})
         {
-            requests.emplace_back(makeLlmRequestWithDP(len, requestId++, requestId % contextTp));
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            requestId++;
         }
         std::vector<std::future<void>> contextFutures;
         std::vector<std::future<void>> generationFutures;
@@ -1216,7 +1226,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         // round robin
                         contextRequests.push_back(requests[i]);
@@ -1239,7 +1249,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         generationRequests.push_back(requests[i]);
                     }
@@ -1342,6 +1352,28 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA2, AsymmetricalCacheTest
         testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(true)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(4), testing::Values(1),
+        testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(true, false), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate1, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(2), testing::Values(2),
+        testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(true, false), testing::Values(false)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate2, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(4, 2), testing::Values(1),
+        testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate4, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1, 2), testing::Values(2),
+        testing::Values(4), testing::Values(1, 2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false)));
+
 #endif
 
 TEST(targetTest, CacheStateNODP)

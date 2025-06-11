@@ -82,12 +82,12 @@ public:
     };
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_fp8_block_scaling, bool use_w4a8_group_scaling)
+        bool use_deepseek_fp8_block_scale, bool use_w4a8_group_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
-        mUseFp8BlockScaling = use_fp8_block_scaling;
+        mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4A8GroupScaling = use_w4a8_group_scaling;
         mInnerDimMultiplier = 1;
 
@@ -270,7 +270,7 @@ public:
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseFp8BlockScaling, min_latency_mode, min_latency_params, stream);
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return output;
     }
@@ -360,7 +360,7 @@ public:
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseFp8BlockScaling, min_latency_mode, min_latency_params, stream);
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
     }
@@ -371,15 +371,15 @@ public:
         return mAllProfiles.size();
     }
 
-    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation)
+    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
+        torch::Tensor const& fc2_expert_weights, int64_t const top_k, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
         // TODO: support profiling under fp8 block scaling in the future
-        if (mUseFp8BlockScaling)
+        if (mUseDeepSeekFP8BlockScaling)
         {
             return;
         }
@@ -396,6 +396,9 @@ public:
         auto const& profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+        auto const* expert_weights_ptr
+            = (gemm_idx == 1) ? fc1_expert_weights.const_data_ptr() : fc2_expert_weights.const_data_ptr();
 
         // Preparation phase, only enabled during autotuning warmup phase.
         if (do_preparation)
@@ -418,18 +421,18 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,
-                min_latency_mode, parallelism_config);
+                min_latency_mode, /*need_weights*/ false, parallelism_config);
 
             freeProfileWorkspace();
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
-            mProfiler->prepare(num_rows, mProfileWorkspace, stream);
+            mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, stream);
+        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, stream);
     }
 
 private:
@@ -450,7 +453,7 @@ private:
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
 
-    bool mUseFp8BlockScaling = false;
+    bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4A8GroupScaling = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
@@ -469,7 +472,7 @@ private:
 
     void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
-        if (mUseFp8BlockScaling)
+        if (mUseDeepSeekFP8BlockScaling)
         {
             auto config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
                 tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape128x16x128B,
@@ -498,7 +501,7 @@ private:
         kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
-            experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling,
+            experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4A8GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
@@ -574,14 +577,14 @@ private:
             TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
                     && fc1_weight_block.sizes()[1] == inter_size * 2
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
-                            * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize
+                            * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
                         == hidden_size,
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
                     && fc2_weight_block.sizes()[2] * FP8_PER_INT32
-                            * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize
+                            * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
                         == inter_size,
                 "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
                 "block_scale_vector_size)");
@@ -593,7 +596,7 @@ private:
                 static_cast<tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
                 static_cast<float const*>(fc2_global.data_ptr()));
         }
-        else if (mUseFp8BlockScaling)
+        else if (mUseDeepSeekFP8BlockScaling)
         {
             auto& fc1_scales = quant_scales.value()[0];
             auto& fc2_scales = quant_scales.value()[1];
@@ -630,7 +633,7 @@ private:
 
     bool isFp8Quant() const
     {
-        return !mUseFp8BlockScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
+        return !mUseDeepSeekFP8BlockScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
             && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }
 

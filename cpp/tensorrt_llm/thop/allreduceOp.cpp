@@ -65,7 +65,7 @@ class NvmlManager
 public:
     NvmlManager()
     {
-        NVML_CHECK(nvmlInit());
+        NVML_CHECK_THROW(nvmlInit());
     }
 
     ~NvmlManager()
@@ -159,7 +159,7 @@ public:
 
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace) noexcept
+        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace)
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -187,7 +187,7 @@ public:
         }
     }
 
-    int initialize() noexcept
+    int initialize()
     {
         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mNcclComm = getComm(mGroup);
@@ -203,7 +203,7 @@ public:
 private:
     std::vector<torch::Tensor> runUBAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
@@ -283,14 +283,14 @@ private:
 
     std::vector<torch::Tensor> runNCCLAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
 
         torch::Tensor reduce_output = torch::empty_like(input);
-        NCCLCHECK(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+        NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
             ncclSum, *mNcclComm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
@@ -372,7 +372,7 @@ private:
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy) noexcept
+        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -554,7 +554,7 @@ private:
     std::vector<torch::Tensor> fallbackRunSubsequentOps(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::Tensor& reduce_output) noexcept
+        torch::Tensor& reduce_output)
     {
         // If we reach here, it means the extra fallback operations are required.
         // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
@@ -619,7 +619,7 @@ private:
         return {};
     }
 
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size) noexcept
+    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
     {
         static char* force_nccl_all_reduce_strategy_char = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
         bool force_nccl_all_reduce_strategy = (force_nccl_all_reduce_strategy_char != nullptr);
@@ -648,7 +648,7 @@ private:
         return runtime_strategy;
     }
 
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank) noexcept
+    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
     {
         switch (strategy)
         {
@@ -676,12 +676,7 @@ private:
         }
     }
 
-    bool Fusable() noexcept
-    {
-        return mOp != AllReduceFusionOp::NONE;
-    }
-
-    void initGroupTopology() noexcept
+    void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool>> cache;
         if (cache.find(mGroup) != cache.end())
@@ -695,7 +690,7 @@ private:
         cache[mGroup] = {mIsNVLINKSupported, mIsP2PSupported};
     }
 
-    void setGroupTopology() noexcept
+    void setGroupTopology()
     {
         auto const rank = COMM_SESSION.getRank();
         TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
@@ -738,7 +733,7 @@ private:
                 }
 
                 nvmlDevice_t first_device;
-                NVML_CHECK(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
+                NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
 
                 bool is_NVLINK = false;
 
@@ -757,7 +752,7 @@ private:
                     {
                         // Two GPUs are connected directly through nvlink
                         unsigned int remote_device_id;
-                        NVML_CHECK(nvmlDeviceGetIndex(remote_device, &remote_device_id));
+                        NVML_CHECK_THROW(nvmlDeviceGetIndex(remote_device, &remote_device_id));
 
                         if (remote_device_id == static_cast<unsigned int>(second_device_id))
                         {
@@ -771,7 +766,7 @@ private:
                         // determine whether nvlink is supported by whether two GPUs are connected to the same
                         // nvswitch.
                         nvmlDevice_t second_device;
-                        NVML_CHECK(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
+                        NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
 
                         for (unsigned int second_link = 0; second_link < NVML_NVLINK_MAX_LINKS; second_link++)
                         {
@@ -791,7 +786,7 @@ private:
                     }
                     else
                     {
-                        NVML_CHECK(result);
+                        NVML_CHECK_THROW(result);
                     }
 
                     if (is_NVLINK)
@@ -806,7 +801,7 @@ private:
         }
     }
 
-    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto) noexcept
+    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto)
     {
         // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
         if (message_size_bytes > max_workspace_size)
@@ -842,7 +837,7 @@ private:
     }
 
     AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type) noexcept
+        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
     {
 
         if (isUsingLowPrecision(message_size))
@@ -1048,13 +1043,82 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+// Pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+// expert_reduction = finalize(input, expanded_idx_to_permuted_idx, expert_scale_factor)
+// output_add = expert_reduction + shared_expert_output
+// output_residual = output_add + residual
+// output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+//
+// Note:
+//     input is the output of MoE FC2
+//     input [maxPermutedPaddedCount, hidden_dim]
+//     residual [m, hidden_dim]
+//     norm_weight [hidden_dim]
+//     expanded_idx_to_permuted_idx [m, top_k]
+//     expert_scale_factor [m, top_k]
+//     shared_expert_output [m, hidden_dim]
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::optional<torch::Tensor> const& shared_expert_output,
+    torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
+    int64_t const nranks, double const eps)
+{
+    auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
+
+    int hidden_dim = residual.size(-1);
+    int top_k = expanded_idx_to_permuted_idx.size(-1);
+
+    allreduce_fusion_params.quant_out = nullptr;
+    allreduce_fusion_params.scale_out = nullptr;
+
+    allreduce_fusion_params.nranks = static_cast<int>(nranks);
+    allreduce_fusion_params.rank = static_cast<int>(rank);
+    allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    // size: num_token * hidden_dim
+    allreduce_fusion_params.size = residual.numel();
+    allreduce_fusion_params.hidden_dim = hidden_dim;
+
+    // workspace: AR scratch space
+    allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
+    allreduce_fusion_params.rms_eps = static_cast<float>(eps);
+    allreduce_fusion_params.residual_in = residual.data_ptr();
+    allreduce_fusion_params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
+
+    // MOE Reduction specific params
+    allreduce_fusion_params.top_k = top_k;
+    allreduce_fusion_params.allreduce_in = input.data_ptr();
+    allreduce_fusion_params.expert_scale_factor
+        = expert_scale_factor.has_value() ? expert_scale_factor.value().data_ptr() : nullptr;
+    allreduce_fusion_params.scale_dtype = tensorrt_llm::runtime::TorchUtils::dataType(
+        expert_scale_factor.has_value() ? expert_scale_factor.value().scalar_type() : input.scalar_type());
+    TORCH_CHECK(
+        expanded_idx_to_permuted_idx.scalar_type() == torch::kInt32, "expanded_idx_to_permuted_idx must be int32");
+    allreduce_fusion_params.expanded_idx_to_permuted_idx
+        = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    allreduce_fusion_params.shared_expert_output
+        = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
+
+    // output tensors
+    torch::Tensor norm_out = torch::empty_like(residual);
+    torch::Tensor residual_out = torch::empty_like(residual);
+
+    allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+
+    tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
+
+    return {norm_out, residual_out};
+}
+
 at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    at::Tensor output = torch::empty_like(input);
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
     allreduce_params.dtype = dtype;
@@ -1076,35 +1140,42 @@ at::Tensor mnnvlTwoShotAllReduce(
     return output;
 }
 
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
-    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
+std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
+    torch::Tensor const& residual, torch::Tensor& buffer_flags)
 {
-    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
+
+    // Input is the communication buffer so we need to get the shape from residual
+    torch::Tensor normed_output = torch::empty_like(residual);
+    torch::Tensor prenorm_output = torch::empty_like(residual);
+
     rmsnorm_params.dtype = dtype;
     rmsnorm_params.residual_output = prenorm_output.data_ptr();
     rmsnorm_params.output = normed_output.data_ptr();
-    rmsnorm_params.input = input.data_ptr();
+    rmsnorm_params.input = comm_buf.data_ptr();
     rmsnorm_params.gamma = gamma.data_ptr();
     rmsnorm_params.epsilon = epsilon;
     rmsnorm_params.residual = residual.data_ptr();
     rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     rmsnorm_params.batch = normed_output.size(0);
     rmsnorm_params.hidden_dim = normed_output.size(1);
-    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(comm_buf.get_device());
 
     tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+
+    return {normed_output, prenorm_output};
 }
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
-        "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
+        "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -1130,6 +1201,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("initialize_static_lowprecision_buffers(Tensor workspace, int tp_size) -> Tensor[]");
+    m.def(
+        "moe_finalize_allreduce("
+        "Tensor input,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor expanded_idx_to_permuted_idx,"
+        "Tensor? shared_expert_output,"
+        "Tensor? expert_scale_factor,"
+        "Tensor workspace,"
+        "int rank,"
+        "int nranks,"
+        "float eps) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1138,6 +1221,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
+    m.impl("moe_finalize_allreduce", &torch_ext::moe_finalize_allreduce);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

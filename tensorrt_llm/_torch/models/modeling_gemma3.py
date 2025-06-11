@@ -14,14 +14,15 @@ from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class Gemma3Attention(Attention):
@@ -56,7 +57,6 @@ class Gemma3Attention(Attention):
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
-            qk_norm_type=QkNormType.pre_rope,
             q_scaling=q_scaling,
         )
         self.q_norm = RMSNorm(hidden_size=config.head_dim,
@@ -70,7 +70,7 @@ class Gemma3Attention(Attention):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -111,6 +111,13 @@ class Gemma3Attention(Attention):
         )
 
         return q, k
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        # Gemma3 applies QK norm before RoPE.
+        q, k, v = self.split_qkv(q, k, v)
+        q, k = self.apply_qk_norm(q, k)
+        return super().apply_rope(q, k, v, position_ids)
 
 
 class Gemma3MLP(nn.Module):
@@ -176,7 +183,7 @@ class Gemma3DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
@@ -231,8 +238,8 @@ class Gemma3TextModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -272,8 +279,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         **kwargs,
@@ -300,14 +307,6 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
