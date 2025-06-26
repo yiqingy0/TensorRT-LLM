@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
+from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
@@ -16,7 +17,8 @@ from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings)
 # isort: on
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -24,7 +26,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -42,7 +44,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "autodeploy"]),
+                 type=click.Choice(["pytorch", "_autodeploy"]),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -95,6 +97,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Pass in a dataset file for parsing instead of stdin.",
 )
 @optgroup.option(
+    "--eos_id",
+    type=int,
+    default=-1,
+    required=False,
+    help=
+    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.",
+)
+@optgroup.option(
     "--modality",
     type=click.Choice(["image", "video"]),
     default=None,
@@ -123,6 +133,22 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Number of requests warm up benchmark.",
 )
 @optgroup.option(
+    "--target_input_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) input length for tuning heuristics.",
+)
+@optgroup.option(
+    "--target_output_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) sequence length for tuning heuristics.",
+)
+@optgroup.group(
+    "World Configuration",
+    help="Options for configuring the backend multi-GPU world.",
+)
+@optgroup.option(
     "--tp",
     type=int,
     default=1,
@@ -145,18 +171,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=int,
     default=None,
     help="expert cluster parallelism size",
-)
-@optgroup.option(
-    "--target_input_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) input length for tuning heuristics.",
-)
-@optgroup.option(
-    "--target_output_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) sequence length for tuning heuristics.",
 )
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
@@ -197,6 +211,29 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Path where iteration logging is written to.",
 )
+@optgroup.option(
+    "--output_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where output should be written to.",
+)
+@optgroup.option(
+    "--enable_chunked_context",
+    is_flag=True,
+    default=False,
+    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+)
+@optgroup.option(
+    "--scheduler_policy",
+    type=click.Choice(["guaranteed_no_evict", "max_utilization"]),
+    default="guaranteed_no_evict",
+    help=
+    "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -208,6 +245,7 @@ def throughput_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.pop("dataset")
+    eos_id: int = params.pop("eos_id")
     warmup: int = params.get("warmup")
     num_requests: int = params.pop("num_requests")
     max_seq_len: int = params.pop("max_seq_len")
@@ -222,6 +260,7 @@ def throughput_command(
 
     # Reporting options
     report_json: Path = params.pop("report_json")
+    output_json: Path = params.pop("output_json")
     iteration_log: Path = params.pop("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
@@ -254,7 +293,12 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "autodeploy"]:
+    if backend and backend.lower() in ["pytorch", "_autodeploy"]:
+        # If we're dealing with a model name, perform a snapshot download to
+        # make sure we have a local copy of the model.
+        if checkpoint_path is None:
+            snapshot_download(model)
+
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
@@ -286,6 +330,8 @@ def throughput_command(
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
     beam_width = params.pop("beam_width")
     streaming: bool = params.pop("streaming")
+    enable_chunked_context: bool = params.pop("enable_chunked_context")
+    scheduler_policy: str = params.pop("scheduler_policy")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -293,7 +339,8 @@ def throughput_command(
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
@@ -310,17 +357,23 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        if "pytorch_backend_config" in kwargs and iteration_log is not None:
-            kwargs["pytorch_backend_config"].enable_iter_perf_stats = True
+        if backend == "pytorch" and iteration_log is not None:
+            kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
 
-        sampling_params = SamplingParams(end_id=-1,
-                                         pad_id=-1,
-                                         beam_width=beam_width)
+        sampling_params = SamplingParams(end_id=eos_id,
+                                         pad_id=eos_id,
+                                         n=beam_width,
+                                         use_beam_search=beam_width > 1)
+        post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:
@@ -330,6 +383,7 @@ def throughput_command(
             asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 warmup_dataset,
                                 False,
                                 concurrency,
@@ -344,6 +398,7 @@ def throughput_command(
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 requests,
                                 streaming,
                                 concurrency,
@@ -362,6 +417,11 @@ def throughput_command(
             with open(report_json, "w") as f:
                 f.write(
                     json.dumps(report_utility.get_statistics_dict(), indent=4))
+        if output_json:
+            logger.info(f"Writing output to {output_json}.")
+            with open(output_json, "w") as f:
+                output_token_info = report_utility.get_output_tokens(tokenizer)
+                f.write(json.dumps(output_token_info, indent=4))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

@@ -313,18 +313,6 @@ void TransformerBuffers::getBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::reshapePositionIds(std::vector<SizeType32> const& positionIdsHost, bool isChatGlm)
-{
-    if (isChatGlm)
-    {
-        positionIds->reshape(ITensor::makeShape({2, static_cast<int>(positionIdsHost.size()) / 2}));
-    }
-    else
-    {
-        positionIds->reshape(ITensor::makeShape({static_cast<int>(positionIdsHost.size())}));
-    }
-}
-
 void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
     std::vector<SizeType32> const& positionIdsHost, bool isChatGlm, TensorPtr const& decoderPositionIds)
 {
@@ -350,32 +338,6 @@ void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
     }
 }
 
-void TransformerBuffers::resetCacheIndirection(RequestVector const& contextRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, TensorPtr const& decoderCacheIndirectionInput,
-    TensorPtr const& decoderCacheIndirectionOutput, BufferManager const& manager)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    NVTX3_SCOPED_RANGE(resetCacheIndirection);
-
-    auto const& stream = manager.getStream();
-    auto const numContextRequests = contextRequests.size();
-
-    std::fill_n(bufferCast<SizeType32>(*fillValuesAlt), numContextRequests, 0);
-    std::transform(contextRequests.begin(), contextRequests.end(), bufferCast<SizeType32>(*seqSlotsAlt),
-        [](auto const& llmReq) { return llmReq->mSeqSlot.value(); });
-
-    auto const seqSlotsHostView = ITensor::slice(seqSlotsAlt, 0, numContextRequests);
-    auto seqSlotsDeviceView = ITensor::slice(seqSlotsAltDevice, 0, numContextRequests);
-    manager.copy(*seqSlotsHostView, *seqSlotsDeviceView);
-    manager.copy(*fillValuesAlt, *fillValuesAltDevice);
-    runtime::kernels::invokeFillBatch(*decoderCacheIndirectionInput, *seqSlotsDeviceView,
-        static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
-    runtime::kernels::invokeFillBatch(*decoderCacheIndirectionOutput, *seqSlotsDeviceView,
-        static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests, RequestVector const& genRequests,
     kv_cache_manager::BaseKVCacheManager const* kvCacheManager,
     kv_cache_manager::BaseKVCacheManager const* crossKvCacheManager, BufferManager const& manager)
@@ -395,7 +357,7 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
         {
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
-            auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->mSamplingConfig.beamWidth;
+            auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->getBeamWidthByIter();
             auto const maxBeamBlockCount
                 = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences, requestId);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
@@ -449,8 +411,15 @@ void TransformerBuffers::copyCacheIndirection(
 
     auto cacheIndirShape = decoderCacheIndirectionOutput->getShape();
 
+    // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+    // be batched together). So, the beam width of the first request is taken here to reshape the buffer.
+    // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+    // a batch in one generation step) is supported in the future.
+    auto reqBeamWidth = genRequests[0]->getBeamWidthByIter();
+
     // Get size of copying from shape of `CacheIndirectionOutput`
     cacheIndirShape.d[0] = 1;
+    cacheIndirShape.d[1] = reqBeamWidth; // Use beam width of current step rather than max beam width as dst offset
     auto const copySize = static_cast<SizeType64>(ITensor::volume(cacheIndirShape));
 
     std::transform(genRequests.begin(), genRequests.end(), batchedCopySrcOffsets.begin(),

@@ -30,24 +30,24 @@ _add_trt_llm_dll_directory()
 import sys
 
 import tensorrt_llm.functional as functional
+import tensorrt_llm.math_utils as math_utils
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
-# Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
-# but may be called in dependencies (such as examples)
-from ._utils import mpi_barrier  # NOQA
-from ._utils import str_dtype_to_torch  # NOQA
+from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                     mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
+                     mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
+                     set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi.llm import LLM, LlmArgs
+from .llmapi import LLM, LlmArgs
+from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM
@@ -69,6 +69,7 @@ __all__ = [
     'local_mpi_rank',
     'local_mpi_size',
     'mpi_barrier',
+    'mpi_comm',
     'mpi_rank',
     'set_mpi_comm',
     'mpi_world_size',
@@ -79,6 +80,9 @@ __all__ = [
     'net_guard',
     'Network',
     'Mapping',
+    'MnnvlMemory',
+    'MnnvlMoe',
+    'MoEAlltoallInfo',
     'PluginBase',
     'Builder',
     'BuilderConfig',
@@ -96,9 +100,12 @@ __all__ = [
     'tools',
     'LLM',
     'LlmArgs',
+    'TorchLlmArgs',
+    'TrtLlmArgs',
     'SamplingParams',
     'DisaggregatedParams',
     'KvCacheConfig',
+    'math_utils',
     '__version__',
 ]
 

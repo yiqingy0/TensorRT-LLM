@@ -65,15 +65,15 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans"]
+        args: ["-L", "Mor,ans,thirdparty"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]
-        files: ".*/auto_deploy/.*"
+        pass_filenames: false
     -   id: ruff-format
-        files: ".*/auto_deploy/.*"
+        pass_filenames: false
 -   repo: https://github.com/executablebooks/mdformat
     rev: 0.7.17
     hooks:

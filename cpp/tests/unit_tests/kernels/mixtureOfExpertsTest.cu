@@ -7,7 +7,13 @@
 #include <gtest/gtest.h>
 #include <numeric>
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
+#include "moe_kernels.h"
+#endif
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h>
@@ -16,6 +22,12 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
+
+using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
+using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 constexpr static float FP8_MAX = 448.f;
 constexpr static float FP4_MAX = 6.f;
@@ -99,11 +111,11 @@ struct sizeof_bits<SafeFP4>
     static constexpr int value = 4;
 };
 } // namespace cutlass
+
+static_assert(sizeof_bits<SafeFP4>::value == 4, "SafeFP4 is not 4 bits");
 #else
 using SafeFP4 = void;
 #endif
-
-static_assert(sizeof_bits<SafeFP4>::value == 4, "SafeFP4 is not 4 bits");
 
 template <class TypeTuple_>
 class MixtureOfExpertsTest : public ::testing::Test
@@ -112,12 +124,22 @@ protected:
     using GemmDataType = typename TypeTuple_::DataType;
     using WeightType = typename TypeTuple_::WeightType;
     using OutputType = typename TypeTuple_::OutputType;
+    constexpr static bool MX_QUANT = TypeTuple_::UseMxQuant;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
-    constexpr static bool FP8 = std::is_same_v<GemmDataType, SafeFP8>;
-    constexpr static bool FP4 = std::is_same_v<GemmDataType, SafeFP4>;
-    constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
-    using InputType = std::conditional_t<FP4, OutputType, GemmDataType>;
+    constexpr static bool FP8 = std::is_same_v<GemmDataType, SafeFP8> && std::is_same_v<WeightType, SafeFP8>;
+    constexpr static bool ACT_FP4 = std::is_same_v<GemmDataType, SafeFP4>;
+    constexpr static bool WEIGHT_FP4 = std::is_same_v<WeightType, SafeFP4>;
+    constexpr static bool NVFP4 = ACT_FP4 && WEIGHT_FP4;
+    static_assert(!NVFP4 || !MX_QUANT, "NVFP4 and MX_QUANT are be mutually exclusive");
+    constexpr static bool MIXED_FP4 = !ACT_FP4 && WEIGHT_FP4;
+    static_assert(MIXED_FP4 || !MX_QUANT, "MIXED_FP4 is only supported with MX_QUANT");
+
+    constexpr static bool ANY_FP4 = WEIGHT_FP4 || ACT_FP4;
+    constexpr static bool ANY_FPX = ANY_FP4 || FP8;
+
+    constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType> && !MIXED_FP4;
+    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
+    using InputType = std::conditional_t<NVFP4, OutputType, GemmDataType>;
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT = 64;
@@ -125,7 +147,10 @@ protected:
     constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT;
 
     // FP4 uses the unquantized data type for inputs and quantizes on the fly
-    using DataType = std::conditional_t<FP4, OutputType, GemmDataType>;
+    using DataType = std::conditional_t<NVFP4, OutputType, GemmDataType>;
+
+    // MIXED_FP4 quantizes just the weights on the fly
+    using WeightRawType = std::conditional_t<MIXED_FP4, OutputType, DataType>;
 
     static BufferManager::CudaStreamPtr mStream;
     static std::unique_ptr<BufferManager> mBufferManager;
@@ -140,7 +165,7 @@ protected:
 
     float getTolerance(float scale = 1.f)
     {
-        bool loose_fp8 = mActType != tensorrt_llm::ActivationType::Relu;
+        bool loose_fp8 = mActType != ActivationType::Relu;
         float tol = std::is_same_v<WeightType, uint8_t>     ? 0.1
             : std::is_same_v<WeightType, cutlass::uint4b_t> ? 0.1
             : std::is_same_v<GemmDataType, float>           ? 0.001
@@ -161,7 +186,7 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
         return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -195,13 +220,15 @@ protected:
     void TearDown() override
     {
         managed_buffers.clear();
+        ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     }
 
-    void initWeights(DataType* buffer, int64_t w, int64_t h, float base, float scalar)
+    void initWeights(WeightRawType* buffer, int64_t w, int64_t h, float base, float scalar)
     {
         dim3 block(16, 16, 1);
         dim3 grid(divUp(w, block.x), divUp(h, block.y), mNumExperts);
-        initWeightsKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base, scalar);
+        initWeightsKernel<WeightRawType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base, scalar);
     }
 
     void initBias(DataType* buffer, int64_t w)
@@ -211,7 +238,7 @@ protected:
         initBiasToExpertIdKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
-    void initWeightsGated(DataType* buffer, int64_t w, int64_t h, float base_1, float base_2, float scalar)
+    void initWeightsGated(WeightRawType* buffer, int64_t w, int64_t h, float base_1, float base_2, float scalar)
     {
         if (!mIsGated)
             return initWeights(buffer, w, h, base_1, scalar);
@@ -219,7 +246,7 @@ protected:
         h /= 2;
         dim3 block(16, 16, 1);
         dim3 grid(divUp(w, block.x), divUp(h, block.y), mNumExperts);
-        initWeightsGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base_1, base_2, scalar);
+        initWeightsGatedKernel<WeightRawType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base_1, base_2, scalar);
     }
 
     void initBiasGated(DataType* buffer, int64_t w)
@@ -237,8 +264,8 @@ protected:
     char* mWorkspace{};
     int* mSelectedExpert;
     float* mTokenFinalScales{};
-    DataType* mRawExpertWeight1{};
-    DataType* mRawExpertWeight2{};
+    WeightRawType* mRawExpertWeight1{};
+    WeightRawType* mRawExpertWeight2{};
     WeightStorage* mExpertWeight1{};
     WeightStorage* mExpertWeight2{};
     DataType* mExpertIntScale1{};
@@ -254,9 +281,11 @@ protected:
     float* mExpertFP4WeightGlobalScale1{};
     float* mExpertFP4WeightGlobalScale2{};
 
-    using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
     using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
-    constexpr static int FP4VecSize = TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
+    constexpr static int FP4VecSize = MX_QUANT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
+                                               : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+    constexpr static int MinAlignmentFP4 = MX_QUANT ? TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX
+                                                    : TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentNVFP4;
     ElementSF* mFP4ScalingFactorsW1 = nullptr;
     ElementSF* mFP4ScalingFactorsW2 = nullptr;
 
@@ -281,7 +310,7 @@ protected:
     int64_t mGatedMultiplier = 1;
     int64_t mGroupSize = -1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
     float mSparseMixerEpsilon = 0.2f;
 
@@ -307,6 +336,8 @@ protected:
 
     float mMaxInput{};
 
+    char mMemsetValue = 0xD5;
+
     template <class AllocType>
     AllocType* allocBuffer(size_t size)
     {
@@ -315,23 +346,25 @@ protected:
         EXPECT_EQ(cudaGetLastError(), cudaSuccess) << "Error allocating buffer of size: " << size;
         AllocType* ptr = static_cast<AllocType*>(managed_buffers.back()->data());
         // Memset to an obviously incorrect value, so we detect any issues with uninitialised fields
-        check_cuda_error(cudaMemsetAsync(ptr, 0xD5, size_bytes, mStream->get()));
+        check_cuda_error(cudaMemsetAsync(ptr, mMemsetValue, size_bytes, mStream->get()));
         return ptr;
     }
 
-    bool checkSufficientTestMemory(int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k)
+    bool checkSufficientTestMemory(
+        int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k, bool parallel = false)
     {
         this->managed_buffers.clear();             // Make sure all the previous buffers are freed
         check_cuda_error(cudaDeviceSynchronize()); // Sync to make sure all previous operations are resolved
 
         // Calculate the size contributions for all the large buffers to check if the GPU has enough space
-        bool const is_gated = tensorrt_llm::isGatedActivation(mActType);
+        bool const is_gated = isGatedActivation(mActType);
         size_t const num_gemms = 2 + is_gated;
         bool const useDeepseek = false;
 
         // Expert weights
-        size_t const weight_size = hidden_size * (hidden_size * mInterSizeFraction) * num_experts
-            * sizeof(WeightStorage) * num_gemms / WEIGHT_ELEM_PER_BYTE;
+        size_t const weight_elems = hidden_size * (hidden_size * mInterSizeFraction) * num_experts * num_gemms;
+        size_t const weight_size = weight_elems * sizeof(WeightStorage) / WEIGHT_ELEM_PER_BYTE;
+
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
             num_experts, k, this->mActType, {}, mUseLora, useDeepseek, false, mUsePrequantScale);
@@ -339,7 +372,18 @@ protected:
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
         // This should be correct to within 100MiB (on tests with 30GiB total)
-        size_t const total_size = workspace_size + weight_size + in_out_size;
+        size_t total_size = workspace_size + weight_size + in_out_size;
+
+        // We allocate an extra shard of the weights for the parallel case, divide by 2 for when TP2
+        if (parallel)
+        {
+            total_size += weight_size / 2;
+        }
+        // Quantized data types use a second scratch buffer for the weights before quantizing
+        if (ANY_FPX || INT_QUANT)
+        {
+            total_size += weight_elems * sizeof(DataType);
+        }
 
         size_t const memory_pool_free_mem_size = mBufferManager->memoryPoolFree();
         auto const [freeMem, totalMem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
@@ -362,7 +406,7 @@ protected:
         mInterSize = hidden_size * mInterSizeFraction;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
@@ -380,21 +424,22 @@ protected:
 
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
 
-        mRawExpertWeight1 = allocBuffer<DataType>(expert_matrix_size * mGatedMultiplier);
-        mRawExpertWeight2 = allocBuffer<DataType>(expert_matrix_size);
+        mRawExpertWeight1 = allocBuffer<WeightRawType>(expert_matrix_size * mGatedMultiplier);
+        mRawExpertWeight2 = allocBuffer<WeightRawType>(expert_matrix_size);
 
         size_t const experts_per_node = mNumExperts / parallelism_config.ep_size;
         int const moe_parallel_size = parallelism_config.tp_size * parallelism_config.ep_size;
 
-        mTpExpertScratchSize = expert_matrix_size * mGatedMultiplier / moe_parallel_size;
-        mTpExpertScratchSize += expert_matrix_size / moe_parallel_size;
+        using SliceWeightType = std::conditional_t<WEIGHT_FP4, WeightRawType, WeightStorage>;
+        mTpExpertScratchSize = sizeof(SliceWeightType) * expert_matrix_size * mGatedMultiplier / moe_parallel_size;
+        mTpExpertScratchSize += sizeof(SliceWeightType) * expert_matrix_size / moe_parallel_size;
 
         mExpertBias1 = nullptr;
         mExpertBias2 = nullptr;
         if (mUseBias)
         {
             // Allow space for the slice of bias1 in the scratch
-            mTpExpertScratchSize += experts_per_node * gated_inter / parallelism_config.tp_size;
+            mTpExpertScratchSize += sizeof(DataType) * experts_per_node * gated_inter / parallelism_config.tp_size;
             mExpertBias1 = allocBuffer<DataType>(mNumExperts * gated_inter);
             mExpertBias2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
 
@@ -407,22 +452,21 @@ protected:
             mExpertWeight1 = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE);
             mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE);
 
-            mTpExpertScratchSize += experts_per_node * gated_inter / parallelism_config.tp_size;
             mExpertIntScale1 = allocBuffer<DataType>(mNumExperts * gated_inter);
             mExpertIntScale2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
         }
-        else if constexpr (FP4)
+        else if constexpr (ANY_FP4)
         {
-            mExpertWeight1 = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE);
-            mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE);
+            // TODO We populate these on the fly, so we can probably reduce these by moe_parallel_size
+            mExpertWeight1 = allocBuffer<WeightStorage>(
+                expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE / moe_parallel_size);
+            mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE / moe_parallel_size);
 
             size_t const padded_fc1_size = mNumExperts * mHiddenSize
-                * cute::ceil_div(
-                    mInterSize * mGatedMultiplier, TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4)
-                * TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
-            size_t const padded_fc2_size = mNumExperts * mInterSize
-                * cute::ceil_div(mHiddenSize, TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4)
-                * TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
+                * cute::ceil_div(mInterSize * mGatedMultiplier / parallelism_config.tp_size, MinAlignmentFP4)
+                * MinAlignmentFP4 / parallelism_config.ep_size;
+            size_t const padded_fc2_size = mNumExperts * mInterSize * cute::ceil_div(mHiddenSize, MinAlignmentFP4)
+                * MinAlignmentFP4 / moe_parallel_size;
             mFP4ScalingFactorsW1 = allocBuffer<ElementSF>(padded_fc1_size / FP4VecSize);
             mFP4ScalingFactorsW2 = allocBuffer<ElementSF>(padded_fc2_size / FP4VecSize);
         }
@@ -432,14 +476,14 @@ protected:
             mExpertWeight2 = mRawExpertWeight2;
         }
 
-        if constexpr (FP8 || FP4)
+        if constexpr (ANY_FPX)
         {
             // FP4 uses the same logic as FP8 to generate the global scales
             mExpertFPXScale1 = allocBuffer<float>(mNumExperts);
             mExpertFPXScale2 = allocBuffer<float>(1);
             mExpertFPXScale3 = allocBuffer<float>(mNumExperts);
 
-            if (FP4)
+            if (ANY_FP4)
             {
                 mExpertFP4ActGlobalScale1 = allocBuffer<float>(1);
                 mExpertFP4WeightGlobalScale1 = allocBuffer<float>(mNumExperts);
@@ -452,7 +496,7 @@ protected:
 
         if (parallelism_config.tp_size > 1 || parallelism_config.ep_size > 1)
         {
-            mTpExpertScratch = allocBuffer<DataType>(mTpExpertScratchSize);
+            mTpExpertScratch = allocBuffer<char>(mTpExpertScratchSize);
         }
 
         mTokenFinalScales = allocBuffer<float>(mTotalTokens * mK);
@@ -522,36 +566,75 @@ protected:
         }
     }
 
-    void doFP4Quant(DataType const* raw_weights, WeightStorage* quant_weights, float const* global_scales,
+    void doFP4Quant(WeightRawType const* raw_weights, WeightStorage* quant_weights, float const* global_scales,
         ElementSF* scaling_factors, int in_shape, int out_shape, int num_experts)
     {
         int const mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-        int padded_stride = cute::ceil_div(out_shape, TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4)
-            * TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
-        check_cuda_error(cudaMemsetAsync(scaling_factors, 0x0,
+        int padded_stride = cute::ceil_div(out_shape, MinAlignmentFP4) * MinAlignmentFP4;
+        check_cuda_error(cudaMemsetAsync(scaling_factors, 0x00,
             num_experts * padded_stride * cutlass::ceil_div(in_shape, FP4VecSize) * sizeof(ElementSF), mStream->get()));
-        for (int i = 0; i < num_experts; i++)
-        {
-            auto* weight_start = raw_weights + i * in_shape * out_shape;
-            auto* quant_weight_start = quant_weights + i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE;
-            auto* scaling_factor_start
-                = scaling_factors + i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize);
+        invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
+            global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
+            MX_QUANT, mMultiProcessorCount, mStream->get());
+        // for (int i = 0; i < num_experts; i++)
+        // {
+        //     auto* weight_start = raw_weights + i * in_shape * out_shape;
+        //     auto* quant_weight_start = quant_weights + i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE;
+        //     auto* scaling_factor_start
+        //         = scaling_factors + i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize);
+        //     printf("Expert %d: Weight offset: %lld, quant_weight_offset: %lld, scaling_factor_offset: %lld\n",
+        //         (long long) i, (long long) i * in_shape * out_shape,
+        //         (long long) i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE,
+        //         (long long) i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize));
 
-            invokeFP4Quantization(out_shape, in_shape, weight_start, global_scales + i,
-                reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start), false,
-                tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
-        }
+        //     check_cuda_error(cudaStreamSynchronize(mStream->get()));
+        //     std::cout << "Quant " << i << " starting" << std::endl;
+        //     auto data = getDataFromDevice(scaling_factor_start, 4 * cutlass::ceil_div(in_shape, FP4VecSize));
+        //     for (auto v : data)
+        //     {
+        //         std::cout << (float) v << ", ";
+        //     }
+        //     std::cout << std::endl;
+
+        //     invokeFP4Quantization<WeightRawType, FP4VecSize>(out_shape, in_shape, weight_start, global_scales + i,
+        //         reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start),
+        //         MX_QUANT, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
+
+        //     // check_cuda_error(cudaStreamSynchronize(mStream->get()));
+        //     // std::cout << "Quant " << i << " done" << std::endl;
+        //     // auto data = getDataFromDevice(mInputTensor, mHiddenSize);
+        //     // for (auto v : data)
+        //     // {
+        //     //     std::cout << (float)v << ", ";
+        //     // }
+        //     // std::cout << std::endl;
+        // }
     }
 
-    constexpr static float getFP8Scalar(float in)
+    constexpr static float getFPXActScalar(float in)
     {
-        if (FP8)
+        // Our FP8 x MXFP4 implementation uses a global scale factor. This should be skipped if we use MXFP8 x MXFP4
+        if (FP8 || MIXED_FP4)
             return FP8_MAX / in;
-        if (FP4)
+        if (NVFP4)
             // We need to represent the block SF using FP8, so the largest value should be at most FP4_MAX * FP8_MAX
             // return FP8_MAX * FP4_MAX / in;
             // We carefully control precision in FP4. We want to avoid introducing any non-powers of two
             return 2.0f;
+        return 1.0f;
+    }
+
+    constexpr static float getFPXWeightScalar(float in)
+    {
+        if (FP8)
+            return FP8_MAX / in;
+        if (NVFP4)
+            // We need to represent the block SF using FP8, so the largest value should be at most FP4_MAX * FP8_MAX
+            // return FP8_MAX * FP4_MAX / in;
+            // We carefully control precision in FP4. We want to avoid introducing any non-powers of two
+            return 2.0f;
+
+        // MX quant does not have a global scale factor
         return 1.0f;
     }
 
@@ -577,12 +660,12 @@ protected:
         }
 
         // Weight scales are well-behaved powers of two so we use a power of two to improve our FP8 precision
-        float scaleW1 = getFP8Scalar(maxW1);
-        float scaleW2 = getFP8Scalar(maxW2);
-        float scaleAct1 = getFP8Scalar(max_input);
+        float scaleW1 = getFPXWeightScalar(maxW1);
+        float scaleW2 = getFPXWeightScalar(maxW2);
+        float scaleAct1 = getFPXActScalar(max_input);
 
         float maxFC1Output = calcMLPVal(max_input, maxIndex) / maxW2;
-        float scaleAct2 = getFP8Scalar(maxFC1Output);
+        float scaleAct2 = getFPXActScalar(maxFC1Output);
 
         ASSERT_NE(mExpertFPXScale1, nullptr);
         ASSERT_NE(mExpertFPXScale2, nullptr);
@@ -591,7 +674,7 @@ protected:
         std::vector<float> scales_1;
         std::vector<float> scales_2;
         std::vector<float> scales_3;
-        if (FP4)
+        if (ANY_FP4)
         {
             std::vector<float> scale_global_w1(mNumExperts);
             std::vector<float> scale_global_w2(mNumExperts);
@@ -605,8 +688,8 @@ protected:
             {
                 float maxW1 = applyExpertShift(maxW1GatedVal, i);
                 float maxW2 = applyExpertShift(mExpertWDiag2, i);
-                float scaleW1 = getFP8Scalar(maxW1);
-                float scaleW2 = getFP8Scalar(maxW2);
+                float scaleW1 = getFPXWeightScalar(maxW1);
+                float scaleW2 = getFPXWeightScalar(maxW2);
                 scale_global_w1[i] = scaleW1;
                 scale_global_w2[i] = scaleW2;
 
@@ -661,7 +744,7 @@ protected:
     template <class T>
     auto populateTokens(std::vector<T>& hidden_states)
     {
-        // Can't use FP8 param because we recurse with a different type
+        // Can't use FP8 param because we recurse with a different type, and we also reuse this for MIXED_FP4
         if constexpr (std::is_same_v<T, SafeFP8>)
         {
             // Call the standard setup and then perform the quantization manually
@@ -669,7 +752,7 @@ protected:
             populateTokens(internal_states);
 
             mMaxInput = *std::max_element(internal_states.begin(), internal_states.end());
-            float scalar = getFP8Scalar(mMaxInput);
+            float scalar = getFPXActScalar(mMaxInput);
             std::transform(internal_states.begin(), internal_states.end(), hidden_states.begin(),
                 [scalar](OutputType in) -> T { return static_cast<T>((float) in * scalar); });
             // Do the reverse transformation since we only have so much precision and this is a pretty broad range
@@ -677,14 +760,14 @@ protected:
                 [scalar](T in) -> OutputType { return static_cast<OutputType>(((float) in) / scalar); });
             return internal_states;
         }
-        else if constexpr (FP4)
+        else if constexpr (ACT_FP4)
         {
             float const max_scale = 1.0f;
             mMaxInput = FP4_MAX * max_scale;
             // Excludes 0.75 as this causes increased quantization error
             std::array allowed_values{-6.f, -4.f, -3.f, -2.f, -1.5f, -1.f, 0.0f, 1.f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
             float scale = 1.f / 32.f;
-            int stride = TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
+            int stride = FP4VecSize;
             for (int i = 0; i < hidden_states.size(); i += stride)
             {
                 for (int j = 0; j < stride; j++)
@@ -706,6 +789,8 @@ protected:
             constexpr int max_order_of_magnitude = 256;
             std::vector<int> base(hidden_states.size());
             std::iota(base.begin(), base.end(), 0);
+            std::mt19937 gen(0xD5);
+            std::shuffle(base.begin(), base.end(), gen);
             // Lambda subtracts a small value so we have some < 0 to test the activation for negatives
             std::transform(base.begin(), base.end(), hidden_states.begin(),
                 [l = hidden_states.size(), max_order_of_magnitude](auto a) {
@@ -748,25 +833,26 @@ protected:
 
     void runMoEPermute(std::vector<DataType> h_hidden_states, std::vector<int> h_token_selected_experts,
         std::vector<float> h_token_final_scales, int64_t hidden_size, int64_t num_experts, int64_t k,
-        MOEParallelismConfig parallelism_config = {})
+        MOEParallelismConfig parallelism_config = {}, bool enable_alltoall = false)
     {
         initBuffersPermute(std::move(h_hidden_states), std::move(h_token_selected_experts),
             std::move(h_token_final_scales), hidden_size, num_experts, k, parallelism_config);
-        runMoEPermute(parallelism_config);
+        runMoEPermute(parallelism_config, enable_alltoall);
     }
 
     auto getWeights(MOEParallelismConfig parallelism_config)
     {
-        void* ep_scale_1 = (FP8 || FP4) ? (void*) mExpertFPXScale1 : (void*) mExpertIntScale1;
-        void* ep_scale_2 = (FP8 || FP4) ? (void*) mExpertFPXScale2 : (void*) mExpertIntScale2;
-        void* ep_scale_3 = (FP8 || FP4) ? mExpertFPXScale3 : nullptr;
+        constexpr bool has_fpx_scales = ANY_FPX;
+        void* ep_scale_1 = has_fpx_scales ? (void*) mExpertFPXScale1 : (void*) mExpertIntScale1;
+        void* ep_scale_2 = has_fpx_scales ? (void*) mExpertFPXScale2 : (void*) mExpertIntScale2;
+        void* ep_scale_3 = has_fpx_scales ? mExpertFPXScale3 : nullptr;
 
-        using SliceWeightType = std::conditional_t<FP4, DataType, WeightStorage>;
-        // FP4 accesses the unquantized weight
-        constexpr int SLICED_WEIGHT_ELEM_PER_BYTE = FP4 ? 1 : WEIGHT_ELEM_PER_BYTE;
+        using SliceWeightType = std::conditional_t<WEIGHT_FP4, WeightRawType, WeightStorage>;
+        // FP4 accesses the unquantized weight, so WEIGHT_ELEM_PER_BYTE is ignored in this context
+        constexpr int SLICED_WEIGHT_ELEM_PER_BYTE = WEIGHT_FP4 ? 1 : WEIGHT_ELEM_PER_BYTE;
         SliceWeightType* slice_weight_1{};
         SliceWeightType* slice_weight_2{};
-        if constexpr (FP4)
+        if constexpr (WEIGHT_FP4)
         {
             slice_weight_1 = mRawExpertWeight1;
             slice_weight_2 = mRawExpertWeight2;
@@ -802,7 +888,7 @@ protected:
             ep_scale_1 = mExpertIntScale1 + scale1_size * parallelism_config.ep_rank;
             ep_scale_2 = mExpertIntScale2 + scale2_size * parallelism_config.ep_rank;
         }
-        if constexpr (FP8 || FP4)
+        if constexpr (has_fpx_scales)
         {
             ep_scale_1 = mExpertFPXScale1 + experts_per_node * parallelism_config.ep_rank;
             ep_scale_3 = mExpertFPXScale3 + experts_per_node * parallelism_config.ep_rank;
@@ -917,7 +1003,7 @@ protected:
 
         int sm = getSMVersion();
         ConfigsToTestVec tactics = {selectTacticsForArch(sm)};
-        if (sm >= 90 && !FP8 && !FP4)
+        if (sm >= 90 && !ANY_FPX)
         {
             // SM90+ should also grab some configs for SM80 to test them
             tactics.push_back(selectTacticsForArch(80));
@@ -925,7 +1011,7 @@ protected:
         return tactics;
     }
 
-    void runMoEPermute(MOEParallelismConfig parallelism_config)
+    void runMoEPermute(MOEParallelismConfig parallelism_config, bool enable_alltoall = false)
     {
         // Clear the buffers to blank so we can assume zero if not written
         resetOutBuffers();
@@ -956,23 +1042,24 @@ protected:
             quant_params = QuantParams::FP8(static_cast<float const*>(scale1_ptr),
                 static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
         }
-        else if (FP4)
+        else if (ANY_FP4)
         {
             ASSERT_TRUE(mExpertFP4ActGlobalScale1);
             ASSERT_TRUE(mFP4ScalingFactorsW1 && mFP4ScalingFactorsW2);
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
-            quant_params = QuantParams::FP4(mExpertFP4ActGlobalScale1, mFP4ScalingFactorsW1,
-                static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2,
-                static_cast<float const*>(scale3_ptr));
+            auto constructor = NVFP4 ? &QuantParams::FP4 : &QuantParams::FP8MXFP4;
+            quant_params
+                = constructor(mExpertFP4ActGlobalScale1, mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
+                    static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
         }
 
-        if constexpr (FP4)
+        if constexpr (WEIGHT_FP4)
         {
             // Dynamically quantize using the proper tp slice
-            doFP4Quant(static_cast<DataType const*>(weight1_ptr), mExpertWeight1, mExpertFP4WeightGlobalScale1,
+            doFP4Quant(static_cast<WeightRawType const*>(weight1_ptr), mExpertWeight1, mExpertFP4WeightGlobalScale1,
                 mFP4ScalingFactorsW1, mHiddenSize, mGatedMultiplier * mInterSize / parallelism_config.tp_size,
                 mNumExperts / parallelism_config.ep_size);
-            doFP4Quant(static_cast<DataType const*>(weight2_ptr), mExpertWeight2, mExpertFP4WeightGlobalScale2,
+            doFP4Quant(static_cast<WeightRawType const*>(weight2_ptr), mExpertWeight2, mExpertFP4WeightGlobalScale2,
                 mFP4ScalingFactorsW2, mInterSize / parallelism_config.tp_size, mHiddenSize,
                 mNumExperts / parallelism_config.ep_size);
             weight1_ptr = mExpertWeight1;
@@ -984,10 +1071,17 @@ protected:
         bool const minLatencyMode = false;
         MoeMinLatencyParams min_latency_params;
         mMoERunner.setTactic(tactic1, tactic2);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
+            weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
+            mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+#else
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
             useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+#endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -1062,13 +1156,13 @@ protected:
     template <class T>
     T actfn(T in)
     {
-        if (mActType == tensorrt_llm::ActivationType::Identity)
+        if (mActType == ActivationType::Identity)
             return in;
-        if (mActType == tensorrt_llm::ActivationType::Relu)
+        if (mActType == ActivationType::Relu)
             return std::max(in, T(0.0f));
-        if (mActType == tensorrt_llm::ActivationType::Gelu || mActType == tensorrt_llm::ActivationType::Geglu)
+        if (mActType == ActivationType::Gelu || mActType == ActivationType::Geglu)
             return (std::erf(float(in) * float(sqrt(0.5))) + 1) * 0.5f * float(in);
-        if (mActType == tensorrt_llm::ActivationType::Silu || mActType == tensorrt_llm::ActivationType::Swiglu)
+        if (mActType == ActivationType::Silu || mActType == ActivationType::Swiglu)
         {
             return (float(in) / (1.f + std::exp(-(in))));
         }
@@ -1156,6 +1250,25 @@ protected:
         return output;
     }
 
+    void compareSourceToExpandedMap(std::vector<int> const& expected_experts,
+        std::vector<int> const& source_to_expanded_map, std::vector<int> const& reference_map)
+    {
+        ASSERT_EQ(expected_experts.size(), source_to_expanded_map.size());
+        ASSERT_EQ(expected_experts.size(), reference_map.size());
+        for (size_t i = 0; i < expected_experts.size(); i++)
+        {
+            // Note: Only check valid positions (expert ids on the current rank).
+            if (expected_experts[i] < mNumExperts)
+            {
+                int token_id = i / mK;
+                int expert_id = i % mK;
+                int interleaved_index = expert_id * mTotalTokens + token_id;
+                ASSERT_EQ(source_to_expanded_map[interleaved_index], reference_map[interleaved_index])
+                    << "Incorrect source_to_expanded_map for token: " << token_id << " expert: " << expert_id;
+            }
+        }
+    }
+
     void compareFinal(std::vector<int> const& expected_experts, std::vector<float> const& token_final_scales,
         std::vector<OutputType> const& input_data, std::vector<OutputType> final_results = {})
     {
@@ -1201,11 +1314,17 @@ protected:
         ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens);
         // 1 expert per rank
         ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens);
+
+        // 2 expert per rank, enable alltoall optimised finalize
+        ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, true);
     }
 
-    // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values
+    // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values (i.e. a
+    // diagonal non-square matrix would be all zeros for the last rank) Note when debugging we occasionally want to edit
+    // the HIDDEN_SIZE_MULTIPLIER to a smaller value to make inspecting weights easier, so account for this so the test
+    // doesn't fail
     void TensorParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
-        int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
+        int64_t num_tokens = 3, float inter_size_fraction = std::min(1.0f, HIDDEN_SIZE_MULTIPLIER / 8.0f))
     {
         mInterSizeFraction = inter_size_fraction;
         ParallelismTest(k, 2, 1, hidden_size, num_experts, num_tokens);
@@ -1228,18 +1347,19 @@ protected:
     }
 
     void ParallelismTest(int k = 1, int tp_size = 4, int ep_size = 2, int64_t hidden_size = DEFAULT_HIDDEN_SIZE,
-        int64_t num_experts = 4, int64_t num_tokens = 3);
+        int64_t num_experts = 4, int64_t num_tokens = 3, bool enable_alltoall = false);
 };
 
 template <class WeightParams>
 using LargeMixtureOfExpertsTest = MixtureOfExpertsTest<WeightParams>;
 
-template <class DataType_, class WeightType_ = DataType_, class OutputType_ = DataType_>
+template <class DataType_, class WeightType_ = DataType_, class OutputType_ = DataType_, bool MX_QUANT_ = false>
 struct WeightParams
 {
     using DataType = DataType_;
     using WeightType = WeightType_;
     using OutputType = OutputType_;
+    constexpr static bool UseMxQuant = MX_QUANT_;
 };
 
 // TODO Fix int quantized
@@ -1251,17 +1371,21 @@ using Types = ::testing::Types<
     WeightParams<SafeFP8, SafeFP8, half>,
 #endif
 #ifdef ENABLE_FP4
-    WeightParams<SafeFP4, SafeFP4, half>,
+    WeightParams<SafeFP4, SafeFP4, half>, WeightParams<SafeFP8, SafeFP4, half, true>,
 #endif
+
     WeightParams<half>, WeightParams<float>
 
-    //, WeightParams<half, uint8_t>, WeightParams<half, cutlass::uint4b_t>
+    //  , WeightParams<half, uint8_t>, WeightParams<half, cutlass::uint4b_t>
 
     >;
 TYPED_TEST_SUITE(MixtureOfExpertsTest, Types);
 
-// Have a separate test with only FP8 and half data type because this test is long
+// Have a separate test with only FP4, FP8 and half data type because this test is long
 using LargeTestTypes = ::testing::Types<
+#ifdef ENABLE_FP4
+    WeightParams<SafeFP4, SafeFP4, half>,
+#endif
 #ifdef ENABLE_FP8
     WeightParams<SafeFP8, SafeFP8, half>,
 #endif
@@ -1279,15 +1403,15 @@ template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
     int k, int64_t hidden_size, int64_t num_experts, int64_t num_tokens)
 {
-    if constexpr (FP8 || FP4)
+    if constexpr (ANY_FPX)
     {
-        // TODO Remove this when bias + FP8 is supported
+        // TODO Remove this when bias + FPX is supported
         mUseBias = false;
     }
 
-    if (FP4)
+    if (NVFP4)
     {
-        if (mActType != tensorrt_llm::ActivationType::Relu)
+        if (mActType != ActivationType::Relu)
         {
             // FP4 has far too little precision to get any sort of consistency with non-relu actfn
             GTEST_SKIP();
@@ -1313,6 +1437,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
+            mMemsetValue = ~mMemsetValue; // Also check it doesn't depend on uninitialised memory
             runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
             auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
             ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
@@ -1321,7 +1446,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
 
         auto proj_map = getDataFromDevice(mSourceToExpandedMap, mTotalTokens * k);
         auto permute_map = calcPermuteMapExpertParallel(expected_experts);
-        ASSERT_EQ(permute_map, proj_map);
+        compareSourceToExpandedMap(expected_experts, proj_map, permute_map);
         compareFinal(expected_experts, token_final_scales, raw_unquant_input);
     }
 }
@@ -1355,7 +1480,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSweepNumTokens)
 TYPED_TEST(MixtureOfExpertsTest, PermuteSweepNumTokensGeglu)
 {
     this->mIsLongTest = true;
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->mActType = ActivationType::Geglu;
     for (int num_tokens : {2, 8, 15, 19, 64, 73, 256})
     {
         this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE, 4, num_tokens);
@@ -1374,7 +1499,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNoBias)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteGelu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Gelu;
+    this->mActType = ActivationType::Gelu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1382,7 +1507,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteGelu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSilu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Silu;
+    this->mActType = ActivationType::Silu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1390,7 +1515,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSilu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->mActType = ActivationType::Geglu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1398,7 +1523,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1430,7 +1555,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNonPowerOfTwo)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteNonPowerOfTwoSwiglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE, 10);
     this->BasicPermuteTest(2, this->DEFAULT_HIDDEN_SIZE, 10);
     this->BasicPermuteTest(3, this->DEFAULT_HIDDEN_SIZE, 10);
@@ -1445,7 +1570,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteManyExperts)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     for (int i = 1; i <= 3; i++)
     {
         this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
@@ -1458,7 +1583,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteMixtral8x7b)
 {
     this->mIsLongTest = true;
     this->mUseBias = false;
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest(2, 4096, 8);
 }
 
@@ -1466,7 +1591,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
 {
     this->mIsLongTest = true;
     this->mUseBias = false;
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     size_t hidden_size = 7168;
     size_t inter_size = 2048;
     this->mInterSizeFraction = float(inter_size) / hidden_size;
@@ -1486,7 +1611,7 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
     int map_idx = 0;
-    for (int expert = 0; expert < mNumExperts * 2; expert++)
+    for (int expert = 0; expert < mNumExperts; expert++)
     {
         for (int i = 0; i < map.size(); i++)
         {
@@ -1500,17 +1625,17 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
 
 template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
-    int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens)
+    int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens, bool enable_alltoall)
 {
-    if (FP8 || FP4)
+    if (ANY_FPX)
     {
-        // TODO Remove this when bias + FP8 is supported
+        // TODO Remove this when bias + FPX is supported
         mUseBias = false;
     }
 
-    if (FP4)
+    if (NVFP4)
     {
-        if (mActType != tensorrt_llm::ActivationType::Relu)
+        if (mActType != ActivationType::Relu)
         {
             // FP4 has far too little precision to get any sort of consistency with non-relu actfn
             GTEST_SKIP();
@@ -1546,14 +1671,15 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 {
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
-                        MOEParallelismConfig{tp_size, i, ep_size, j});
+                        MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
                         = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
+                        mMemsetValue = ~mMemsetValue; // Also check it doesn't depend on uninitialised memory
                         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
-                            MOEParallelismConfig{tp_size, i, ep_size, j});
+                            MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                         auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
                         ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
                             << "Running permute a second time does not generate the same results";
@@ -1561,13 +1687,13 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 }
                 else
                 {
-                    runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
+                    runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
                         = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
-                        runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
+                        runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                         auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
                         ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
                             << "Running permute a second time does not generate the same results";
@@ -1577,9 +1703,12 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_size, j);
                 auto proj_map = getDataFromDevice(mSourceToExpandedMap, mTotalTokens * k);
                 auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
-                ASSERT_EQ(permute_map, proj_map) << "Iteration " << i << " " << j << " seq len " << num_tokens;
+                compareSourceToExpandedMap(masked_expected_experts, proj_map, permute_map);
 
                 // Do the final reduce
+                // Note: For enable_alltoall=false, the invalid positions (expert ids outside the current rank) are
+                // filled with 0 by mMoERunner.runMoe. For enable_alltoall=true, the invalid positions are untouched by
+                // mMoERunner.runMoe, but they are filled with 0 by resetOutBuffers.
                 auto iter_results = getDataFromDevice(mFinalOutput, mTotalTokens * hidden_size);
                 std::transform(
                     iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
@@ -1618,7 +1747,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##SweepNumTokensGeglu)                                             \
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
-        this->mActType = tensorrt_llm::ActivationType::Geglu;                                                          \
+        this->mActType = ActivationType::Geglu;                                                                        \
         for (int num_tokens : {2, 8, 15, 64, 73, 256})                                                                 \
         {                                                                                                              \
             this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 4, num_tokens);                                  \
@@ -1636,21 +1765,21 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Gelu)                                                            \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Gelu;                                                           \
+        this->mActType = ActivationType::Gelu;                                                                         \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Silu)                                                            \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Silu;                                                           \
+        this->mActType = ActivationType::Silu;                                                                         \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Geglu)                                                           \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Geglu;                                                          \
+        this->mActType = ActivationType::Geglu;                                                                        \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
@@ -1658,7 +1787,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Swiglu)                                                          \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
@@ -1668,24 +1797,24 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = false;                                                                                        \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test(2, 4096, 8, 8, 14336.f / 4096.f);                                                  \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##DeepSeekV3)                                                      \
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = false;                                                                                        \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 7168;                                                                                     \
         size_t inter_size = 2048;                                                                                      \
         this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
                                                                                                                        \
-        if (!this->checkSufficientTestMemory(100, hidden_size, 256, 8))                                                \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 100, this->mInterSizeFraction);                               \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
@@ -1697,7 +1826,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoSwiglu)                                             \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
         this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
         this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
@@ -1707,7 +1836,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         /* This test is very slow. Only do one k value */                                                              \
-        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512, 3, this->FP4 ? 8.0f : 4.0f);                      \
+        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512, 3, this->ANY_FP4 ? 8.0f : 4.0f);                  \
     }
 
 PARALLEL_TEST_SUITE(ExpertParallel)
@@ -1740,10 +1869,9 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
         return tactic.str();
     };
 
-    auto activation_pool = std::vector{
-        tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Swiglu, tensorrt_llm::ActivationType::Geglu};
-    if (this->FP4)
-        activation_pool = {tensorrt_llm::ActivationType::Relu};
+    auto activation_pool = std::vector{ActivationType::Relu, ActivationType::Swiglu, ActivationType::Geglu};
+    if (this->NVFP4)
+        activation_pool = {ActivationType::Relu};
     auto configs = this->getFilteredConfigs(getSMVersion());
     for (auto const activation_type : activation_pool)
     {
@@ -1798,9 +1926,9 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLargeExperts)
 TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
 {
     this->mIsLongTest = true;
-    this->mUseBias = !this->FP8;
+    this->mUseBias = !this->ANY_FPX;
 
-    using DataType = typename TypeParam::DataType;
+    using DataType = typename MixtureOfExpertsTest<TypeParam>::DataType;
     // Sequence * hidden size > INT32_MAX
     int64_t hidden_size = 2048ll;
     int64_t num_experts = 4;
@@ -1842,6 +1970,88 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     this->compareFinal(token_selected_experts, token_final_scales, unquant_states);
 }
 
+template <class T>
+constexpr static auto typeToDtypeID()
+{
+    if constexpr (std::is_same_v<T, SafeFP8>)
+    {
+        return nvinfer1::DataType::kFP8;
+    }
+    else if constexpr (std::is_same_v<T, SafeFP4>)
+    {
+        return nvinfer1::DataType::kFP4;
+    }
+    else if constexpr (std::is_same_v<T, uint8_t>)
+    {
+        return nvinfer1::DataType::kINT8;
+    }
+    else if constexpr (std::is_same_v<T, cutlass::uint4b_t>)
+    {
+        return nvinfer1::DataType::kINT4;
+    }
+    else if constexpr (std::is_same_v<T, nv_bfloat16>)
+    {
+        return nvinfer1::DataType::kBF16;
+    }
+    else if constexpr (std::is_same_v<T, half>)
+    {
+        return nvinfer1::DataType::kHALF;
+    }
+    else if constexpr (std::is_same_v<T, float>)
+    {
+        return nvinfer1::DataType::kFLOAT;
+    }
+    else
+    {
+        // sizeof(T) to make the static assert dependent on the template
+        static_assert(sizeof(T) == 0, "Unrecognised data type");
+    }
+}
+
+TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
+{
+    auto test_func = [this](GemmProfilerBackend::GemmToProfile gemm_to_profile)
+    {
+        int64_t num_experts = 4;
+        int64_t k = 2;
+
+        GemmProfilerBackend backend;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
+            typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
+            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
+            ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            /*need_weights=*/true, MOEParallelismConfig{}, /*enable_alltoall=*/false);
+#else
+        backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
+            typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
+            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
+            ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            /*need_weights=*/true, MOEParallelismConfig{});
+#endif
+
+        auto ws_size = backend.getWorkspaceSize(128);
+
+        auto workspace = this->template allocBuffer<char>(ws_size);
+
+        for (int64_t num_tokens : {1, 128})
+        {
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, this->mStream->get());
+            for (auto const& tactic : this->getAllTileConfigsToTest())
+            {
+                backend.runProfiler(num_tokens,
+                    gemm_to_profile == GemmProfilerBackend::GemmToProfile::GEMM_1 ? tactic.first : tactic.second,
+                    workspace, /*expert_weights=*/nullptr, this->mStream->get());
+            }
+        }
+        ASSERT_EQ(cudaStreamSynchronize(this->mStream->get()), cudaSuccess);
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    };
+    ASSERT_NO_THROW(test_func(GemmProfilerBackend::GemmToProfile::GEMM_1)) << "Failed to profile GEMM_1";
+    ASSERT_NO_THROW(test_func(GemmProfilerBackend::GemmToProfile::GEMM_2)) << "Failed to profile GEMM_2";
+}
+
+// Data types don't matter for the distribution
 using MixtureOfExpertsProfilerTest = MixtureOfExpertsTest<WeightParams<half, half>>;
 
 TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
@@ -1858,34 +2068,43 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         int64_t expanded_num_tokens = num_tokens * k;
         for (int ep : {1, 4, 8})
         {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1},
+                /*enable_alltoall=*/false);
+#else
+            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1});
+#endif
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
-
             int64_t num_experts_per_node = num_experts / ep;
 
-            backend.prepare(num_tokens, workspace, mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, mStream->get());
 
-            auto getNext = backend.getWorkspacePointerGenerator(
-                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
-            auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
-            auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
-            auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());
-            auto const* token_selected_experts = reinterpret_cast<int*>(getNext());
+            auto workspaces = backend.getProfilerWorkspaces(num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
+#define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
+
+            GET_WS_PTR(int64_t*, expert_first_token_offset);
+            GET_WS_PTR(int*, source_to_dest);
+            GET_WS_PTR(int*, dest_to_source);
+            GET_WS_PTR(int*, unpermuted_selected_experts);
+
+#undef GET_WS_PTR
 
             for (int sample = 0; sample < backend.NUM_ROUTING_SAMPLES; sample++)
             {
                 auto host_expert_first_token_offset_size = getDataFromDevice(
-                    expert_first_token_offset_size + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
+                    expert_first_token_offset + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
                 auto host_source_to_dest_map
-                    = getDataFromDevice(source_to_dest_map + sample * expanded_num_tokens, expanded_num_tokens);
+                    = getDataFromDevice(source_to_dest + sample * expanded_num_tokens, expanded_num_tokens);
                 auto host_dest_to_source_map
-                    = getDataFromDevice(dest_to_source_map + sample * expanded_num_tokens, expanded_num_tokens);
-                auto host_token_selected_experts
-                    = getDataFromDevice(token_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+                    = getDataFromDevice(dest_to_source + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_token_selected_experts = getDataFromDevice(
+                    unpermuted_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
 
                 std::vector<int64_t> calculated_routing_values(num_experts_per_node + 1, 0);
                 int skipped = 0;

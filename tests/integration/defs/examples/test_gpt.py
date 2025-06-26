@@ -16,7 +16,6 @@
 import csv
 import os
 import re
-import uuid
 from pathlib import Path
 
 import pytest
@@ -25,13 +24,8 @@ from defs.common import (convert_weights, generate_summary_cmd, parse_mpi_cmd,
                          similarity_score, test_multi_lora_support,
                          venv_check_call, venv_check_output,
                          venv_mpi_check_call, venv_mpi_check_output)
-from defs.conftest import (evaltool_humaneval_post_process, get_device_memory,
-                           skip_fp8_pre_ada, skip_pre_ada)
+from defs.conftest import get_device_memory, skip_fp8_pre_ada, skip_pre_ada
 from defs.trt_test_alternative import check_call
-from evaltool.constants import (EVALTOOL_HUMAN_EVAL_CONFIG,
-                                EVALTOOL_HUMAN_EVAL_RESULT_FILE,
-                                EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
-                                EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT)
 
 INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "Dinwiddie ordered him to lead a larger force to assist Trent in his work. " + \
@@ -777,9 +771,12 @@ def test_llm_gpt2_int8_kv_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
 
 @skip_pre_ada
 @pytest.mark.parametrize("quant_lm_head", [True, False])
+@pytest.mark.parametrize("qformat", ["fp8", "fp8_pc_pt"])
 def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
                              llm_datasets_root, llm_rouge_root, llm_venv,
-                             cmodel_dir, engine_dir, quant_lm_head):
+                             cmodel_dir, engine_dir, quant_lm_head, qformat):
+    if qformat == "fp8_pc_pt" and quant_lm_head:
+        pytest.skip("Skipping test for fp8_pc_pt with quant_lm_head")
     "Build & Run gpt2-medium fp8 with 1 gpu"
     print("Quantizing and converting checkpoint...")
     dtype = "float16"
@@ -790,7 +787,7 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
         f"--model_dir={llm_gpt2_medium_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
-        "--qformat=fp8",
+        f"--qformat={qformat}",
         f"--output_dir={ckpt_dir}",
     ]
     if quant_lm_head:
@@ -811,7 +808,8 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     print('Run engines...')
-    rouge1_threshold = 17.2 if quant_lm_head else 17.4
+    rouge1_threshold = 22.8 if qformat == "fp8_pc_pt" else (
+        20.9 if quant_lm_head else 21.7)
     summary_cmd = [
         f"{gpt_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
@@ -1710,91 +1708,6 @@ def test_llm_gpt2_multi_lora_1gpu(gpt_example_root, llm_venv,
     for idx, result in enumerate(output):
         assert any([similar(item, result)
                     for item in expected_output[idx]]), f"output is {output}"
-
-
-@pytest.mark.parametrize("starcoder_model_root",
-                         ['starcoder', 'starcoder2-15b', 'starcoderplus'],
-                         indirect=True)
-def test_llm_gpt_starcoder_humaneval(gpt_example_root, starcoder_model_root,
-                                     llm_venv, engine_dir, cmodel_dir,
-                                     evaltool_root):
-    "Run gpt2 starcoder human eval tests"
-    print("Converting checkpoint...")
-    print(f"cmodel dir is {cmodel_dir}")
-    dtype = 'float16'
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=gpt_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model="gpt2-starcoder",
-                               model_path=starcoder_model_root,
-                               data_type=dtype)
-
-    print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={8}",
-        f"--max_input_len={4096}",
-        f"--max_seq_len={6144}",
-        f"--gpt_attention_plugin={dtype}",
-        f"--gemm_plugin={dtype}",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print('Run human eval')
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        starcoder_model_root, "-d", evaltool_root, "-m", "768"
-    ]
-    check_call(" ".join(start_inference_server), shell=True)
-
-    try:
-        # Update config dynamically
-        config_file = EVALTOOL_HUMAN_EVAL_CONFIG
-        model_name = os.path.basename(starcoder_model_root)
-
-        import yaml
-        with open(config_file, 'r') as f:
-            humaneval_config = yaml.safe_load(f)
-            humaneval_config['model']['llm_name'] = model_name
-            humaneval_config['model']['tokenizer_path'] = starcoder_model_root
-        config_file = os.path.join(llm_venv.get_working_directory(),
-                                   f"{model_name}_humaneval_config.yaml")
-        with open(config_file, 'w') as f:
-            yaml.dump(humaneval_config, f)
-
-        print("print('Run human eval')")
-        project_id = str(uuid.uuid4())
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            "evaltool/interfaces/cli/main.py",
-            "project",
-            "launch",
-            f"--eval_project_config_file '{config_file}'",
-            "--infra_name local",
-            f"--output_dir '{llm_venv.get_working_directory()}'",
-            f"--project_id {project_id}",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}", shell=True)
-
-    result_path = f"{llm_venv.get_working_directory()}/{project_id}/{EVALTOOL_HUMAN_EVAL_RESULT_FILE}"
-    check_call(f"cat {result_path}", shell=True)
-
-    if 'starcoder2' in starcoder_model_root:
-        evaltool_humaneval_post_process(result_path, 0.3719, 0.025)
-    elif 'starcoderplus' in starcoder_model_root:
-        evaltool_humaneval_post_process(result_path, 0.2560, 0.025)
-    else:
-        evaltool_humaneval_post_process(result_path, 0.3232, 0.025)
 
 
 @pytest.mark.skip_less_device_memory(50000)

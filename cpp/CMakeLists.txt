@@ -43,6 +43,15 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -51,36 +60,21 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
+
+set(INTERNAL_CUTLASS_KERNELS_PATH
+    ""
+    CACHE
+      PATH
+      "The path to internal cutlass kernels sources. Prebuilt binary for internal cutlass kernels will be used if this is not set."
 )
-  set(BUILD_NVRTC_WRAPPER_DEFAULT ON)
-else()
-  set(BUILD_NVRTC_WRAPPER_DEFAULT OFF)
-endif()
-
-option(BUILD_NVRTC_WRAPPER "Build nvrtc wrapper from source"
-       ${BUILD_NVRTC_WRAPPER_DEFAULT})
-
-if(BUILD_NVRTC_WRAPPER)
-  message(STATUS "Building nvrtc wrapper")
-else()
-  message(STATUS "Importing nvrtc wrapper")
-endif()
-
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
-)
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
-else()
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT OFF)
-endif()
-option(BUILD_INTERNAL_CUTLASS_KERNELS
-       "Build internal cutlass kernels from source"
-       ${BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT})
-
-if(BUILD_INTERNAL_CUTLASS_KERNELS)
-  message(STATUS "Building internal cutlass kernels")
+if(INTERNAL_CUTLASS_KERNELS_PATH)
+  message(
+    STATUS
+      "Building internal cutlass kernels from source at ${INTERNAL_CUTLASS_KERNELS_PATH}"
+  )
 else()
   message(STATUS "Importing internal cutlass kernels")
 endif()
@@ -124,7 +118,7 @@ set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
                                     ${TRTLLM_VERSION_DIR}/version.py)
 execute_process(
-  COMMAND python3 -c "import version; print(version.__version__)"
+  COMMAND ${Python_EXECUTABLE} -c "import version; print(version.__version__)"
   WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
   OUTPUT_VARIABLE TRTLLM_VERSION
   RESULT_VARIABLE TRTLLM_VERSION_RESULT
@@ -154,7 +148,16 @@ set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
+set(NVPTX_LIB CUDA::nvptxcompiler_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_LIB CUDA::nvrtc)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+else()
+  set(NVRTC_LIB CUDA::nvrtc_static)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+endif()
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -386,21 +389,25 @@ print(os.path.dirname(torch.__file__),end='');"
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+  set(USE_SYSTEM_NVTX ON)
+  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
-
-  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-  add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
 
-  if(DEFINED USE_CXX11_ABI)
-    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
-      message(
-        WARNING
-          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-          "setting will be discarded.")
+  if(DEFINED TORCH_CXX_FLAGS)
+    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+    add_compile_options(${TORCH_CXX_FLAGS})
+    if(DEFINED USE_CXX11_ABI)
+      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+             ${USE_CXX11_ABI})
+        message(
+          WARNING
+            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+            "setting will be discarded.")
+      endif()
     endif()
   endif()
 

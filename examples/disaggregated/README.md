@@ -9,14 +9,15 @@ You can use multiple `trtllm-serve` commands to launch the context and generatio
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "pytorch_backend_config:\n  enable_overlap_scheduler: False" > extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
 
 export TRTLLM_USE_UCX_KVCACHE=1
 #Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
 #Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
@@ -52,7 +53,7 @@ export TRTLLM_USE_MPI_KVCACHE=1
 mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
 ```
 where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
-since `TP` and `PP` is 1 for all context and generation servers.
+since `TP` and `PP` is 1 for the two context and one generation server.
 
 The `disagg_config.yaml` file must now contain the configuration parameters of the context and generation servers. For example,
 it could look like:
@@ -62,11 +63,10 @@ hostname: localhost
 port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 backend: "pytorch"
-pytorch_backend_config:
-  use_cuda_graph: False
-  enable_overlap_scheduler: False
+use_cuda_graph: False
+disable_overlap_scheduler: True
 context_servers:
-  num_instances: 1
+  num_instances: 2
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
@@ -98,7 +98,7 @@ curl http://localhost:8000/v1/completions     -H "Content-Type: application/json
         "temperature": 0
     }' -w "\n"
 ```
-Or using the provided client:
+Or using the provided client parsing the prompts from a file and sending request to the disaggregated server specified in the `disagg_config.yaml` file at the `chat` endpoint:
 ```
-python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json
+python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```

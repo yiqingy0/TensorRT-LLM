@@ -32,13 +32,14 @@ class Request::Impl
 {
 
 public:
-    // 34 parameters, 34 items in initialization list
+    // 36 parameters, 36 items in initialization list
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig,
-        std::optional<PromptTuningConfig> pTuningConfig, std::optional<MropeConfig> mRopeConfig,
+        std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
+        std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
         std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
         std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
@@ -61,6 +62,8 @@ public:
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
         , mExternalDraftTokensConfig(std::move(externalDraftTokensConfig))
         , mPTuningConfig(std::move(pTuningConfig))
+        , mMultimodalInput(std::move(multimodalInput))
+        , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(lookaheadConfig)
@@ -173,6 +176,16 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const
     {
         return mPTuningConfig;
+    }
+
+    [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const
+    {
+        return mMultimodalEmbedding;
+    }
+
+    [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const
+    {
+        return mMultimodalInput;
     }
 
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const
@@ -338,6 +351,16 @@ public:
         mPTuningConfig = pTuningConfig;
     }
 
+    void setMultimodalEmbedding(Tensor const& multimodalEmbedding)
+    {
+        mMultimodalEmbedding = multimodalEmbedding;
+    }
+
+    void setMultimodalInput(MultimodalInput const& multimodalInput)
+    {
+        mMultimodalInput = multimodalInput;
+    }
+
     void setMropeConfig(MropeConfig const& mRopeConfig)
     {
         mMropeConfig = mRopeConfig;
@@ -498,6 +521,8 @@ private:
         lambda(mEmbeddingBias);
         lambda(mExternalDraftTokensConfig);
         lambda(mPTuningConfig);
+        lambda(mMultimodalInput);
+        lambda(mMultimodalEmbedding);
         lambda(mMropeConfig);
         lambda(mLoraConfig);
         lambda(mLookaheadConfig);
@@ -533,6 +558,8 @@ private:
     std::optional<Tensor> mEmbeddingBias;
     std::optional<ExternalDraftTokensConfig> mExternalDraftTokensConfig;
     std::optional<PromptTuningConfig> mPTuningConfig;
+    std::optional<MultimodalInput> mMultimodalInput;
+    std::optional<Tensor> mMultimodalEmbedding;
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
     std::optional<LookaheadDecodingConfig> mLookaheadConfig;

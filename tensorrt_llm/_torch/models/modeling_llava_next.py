@@ -1,42 +1,98 @@
 import copy
-from typing import Dict, List, Optional, Tuple
+import os
+from typing import List, Optional, Tuple
 
 import torch
-from transformers import (AutoModel, AutoProcessor, LlavaNextConfig,
-                          LlavaNextForConditionalGeneration, PretrainedConfig,
-                          PreTrainedModel)
+import torch.nn as nn
+from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
+                          LlavaNextConfig, PretrainedConfig, PreTrainedModel)
+from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.llava_next.modeling_llava_next import \
+    LlavaNextMultiModalProjector
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
+from ...llmapi.utils import download_hf_model
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
+from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import ModelConfig, register_auto_model
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 
 class LlavaNextInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+        self.use_fast = True
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=self.use_fast)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
         self.model_config = model_config
 
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=model_config.text_config.torch_dtype)
         self.device = 'cuda'
-        self.vision_tower = model.vision_tower.vision_model.to(self.device)
-        self.mm_projector = model.multi_modal_projector.to(self.device)
+
+        # Determine the actual local path for model files
+        if os.path.isdir(model_path):
+            local_model_path = model_path
+        else:
+            local_model_path = download_hf_model(model_path)
+
+        # Partially load the model to reduce memory usage(Vision tower and multi-modal projector)
+        hf_model_config = AutoConfig.from_pretrained(local_model_path)
+        self.dtype = hf_model_config.text_config.torch_dtype
+        module_dict = nn.ModuleDict({
+            "vision_tower":
+            AutoModel.from_config(hf_model_config.vision_config),
+            "multi_modal_projector":
+            LlavaNextMultiModalProjector(hf_model_config)
+        })
+        missing_keys, _ = load_sharded_checkpoint(module_dict,
+                                                  local_model_path,
+                                                  strict=False)
+        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
+        hf_mm_projector = module_dict["multi_modal_projector"].to(
+            self.dtype).to(self.device)
+
+        # For A100 GPU, fallback to HF vision tower due to accuracy issue in TRT-LLM CLIPAttention
+        # Otherwise, use TRTLLM vision tower(CLIPVisionModel)
+        prop = torch.cuda.get_device_properties(0)
+        sm_version = prop.major * 10 + prop.minor
+        self.use_hf_vision_tower = sm_version == 80
+        if self.use_hf_vision_tower:
+            self.vision_tower = hf_vision_tower.to(self.device)
+        else:
+            vision_model_config = ModelConfig(
+                pretrained_config=model_config.vision_config,
+                attn_backend="TRTLLM")
+            self.vision_tower = CLIPVisionModel(vision_model_config).to(
+                self.device).to(self.dtype)
+            self.vision_tower.load_weights(hf_vision_tower.state_dict())
+
+        # Use HF multi-modal projector
+        self.mm_projector = hf_mm_projector
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
         return [
             self.processor(text="dummy",
                            images=image,
-                           do_rescale=not isinstance(image, torch.Tensor),
+                           do_rescale=not isinstance(images[0], torch.Tensor),
                            return_tensors="pt",
                            device=self.device)['pixel_values'][0].to(
                                self.device) for image in images
@@ -44,9 +100,17 @@ class LlavaNextInputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        image_features = self.vision_tower(pixel_values,
-                                           output_hidden_states=True)
-        selected_image_feature = image_features.hidden_states[-2][:, 1:]
+        if self.use_hf_vision_tower:
+            image_features = self.vision_tower(
+                pixel_values, output_hidden_states=True).hidden_states
+        else:
+            attn_metadata = self.vision_tower.prepare_attn_metadata(
+                pixel_values.shape[0])
+            image_features: Tuple[torch.Tensor] = self.vision_tower(
+                pixel_values,
+                attn_metadata=attn_metadata,
+            )
+        selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
         return image_features.reshape(-1, image_features.shape[-1])
 
@@ -147,12 +211,12 @@ class LlavaNextInputProcessor(InputProcessor):
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": [mm_features, None, None]
+            "mm_embedding": mm_features
         }
 
 
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(LlavaNextInputProcessor)
+@register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 
@@ -184,15 +248,6 @@ class LlavaNextModel(PreTrainedModel):
 
     def load_weights(self, weights):
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v.to(self.dtype)
-                    assert result[new_k] is not None
-            return result
-
         weights = filter_weights("language_model", weights)
         self.llm.load_weights(weights)
 
@@ -207,8 +262,8 @@ class LlavaNextModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,
@@ -221,7 +276,8 @@ class LlavaNextModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

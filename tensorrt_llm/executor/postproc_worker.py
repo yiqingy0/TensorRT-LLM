@@ -14,6 +14,7 @@ from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
+from .utils import is_llm_response
 
 if TYPE_CHECKING:
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
@@ -110,7 +111,6 @@ class PostprocWorker:
     ) -> "DetokenizedGenerationResultBase":
         from .result import DetokenizedGenerationResultBase
         assert inp.sampling_params is not None
-        assert tokenizer is not None
         return DetokenizedGenerationResultBase(
             inp.rsp.client_id,
             sampling_params=inp.sampling_params,
@@ -171,8 +171,8 @@ class PostprocWorker:
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
-            is_final = inp.rsp.result.is_final if isinstance(
-                inp.rsp, tllm.Response) else True
+            is_final = inp.rsp.result.is_final if is_llm_response(
+                inp.rsp) else True
             res = await self._handle_input(inp)
             batch.append(PostprocWorker.Output(client_id, res, is_final))
             if is_final:

@@ -26,8 +26,8 @@ from .._utils import mpi_broadcast
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
-from ..bindings.executor import (ExternalDraftTokensConfig, OrchestratorConfig,
-                                 ParallelConfig)
+from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
+                                 OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..layers import MropeParams
 from ..logger import logger
@@ -348,6 +348,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
                 w, n, g)
 
+        if use_variable_beam_width_search:
+            decoding_config.decoding_mode = DecodingMode.BeamSearch(
+            ).useVariableBeamWidthSearch(True)
+
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
         else:
@@ -390,7 +394,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
             use_gpu_direct_storage=use_gpu_direct_storage,
             gpu_weights_percent=gpu_weights_percent,
             gather_generation_logits=gather_generation_logits,
-            use_variable_beam_width_search=use_variable_beam_width_search,
         )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
@@ -497,7 +500,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
     @property
     def num_layers(self) -> int:
         return self.model_config.num_layers(
-            self.world_config.pipeline_parallelism)
+            self.world_config.pipeline_parallelism,
+            self.world_config.pipeline_parallel_rank,
+        )
 
     @property
     def max_sequence_length(self) -> int:
@@ -865,6 +870,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 ]
         return prompt_tuning_configs
 
+    # TODO: add multimodal input for TRT engine backend
+
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
         if mrope != None:
@@ -928,13 +935,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
         output_ids = [[[] for _ in range(num_sequences)]
                       for _ in range(len(request_ids))]
 
-        multi_responses = self.session.await_responses(request_ids)
-        responses = [
-            response for responses in multi_responses for response in responses
-        ]
+        all_responses = []
+        finished_request_ids = set()
+        while finished_request_ids != set(request_ids):
+            responses = self.session.await_responses()
+            for response in responses:
+                if response.result.is_final:
+                    finished_request_ids.add(response.request_id)
+            all_responses.extend(responses)
 
         return self._fill_output(
-            responses=responses,
+            responses=all_responses,
             output_ids=output_ids,
             end_id=end_id,
             return_dict=return_dict,

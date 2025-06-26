@@ -1,17 +1,38 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# MIT License
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Copyright (c) 2020 Dan Hendrycks
+# Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Not a contribution
+# Changes made by NVIDIA CORPORATION & AFFILIATES or otherwise documented as
+# NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
+# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
 import math
 from typing import Iterable, List, Optional, Union
 
@@ -19,14 +40,17 @@ import click
 import numpy as np
 import pandas as pd
 
-from .._torch import LLM as PyTorchLLM
-from ..llmapi import LLM, RequestOutput
+from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
+from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
 
 
 class MMLU(Evaluator):
+    DATASET_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
+
     CHOICES = ["A", "B", "C", "D"]
     SUBJECT_TO_SUBCATEGORIES = {
         "abstract_algebra": ["math"],
@@ -108,22 +132,48 @@ class MMLU(Evaluator):
     }
 
     def __init__(self,
-                 dataset_path: str,
+                 dataset_path: Optional[str] = None,
                  num_samples: Optional[int] = None,
-                 num_train: int = 5,
+                 num_fewshot: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
+        if dataset_path is None:
+            dataset_path = self.dowload_dataset()
         self.dataset_path = dataset_path
         if num_samples is None:
             self.num_samples_per_subject = None
         else:
             self.num_samples_per_subject = math.ceil(
                 num_samples / len(self.SUBJECT_TO_SUBCATEGORIES))
-        self.num_train = num_train
+        self.num_fewshot = num_fewshot
+
+    def dowload_dataset(self):
+        import os
+        import tarfile
+        from tempfile import TemporaryDirectory
+
+        import requests
+
+        self.tempdir = TemporaryDirectory()
+        workspace = self.tempdir.name
+
+        response = requests.get(self.DATASET_URL, timeout=60)
+        with open(f"{workspace}/data.tar", "wb") as f:
+            f.write(response.content)
+
+        with tarfile.open(f"{workspace}/data.tar") as tar:
+            for member in tar.getmembers():
+                member_path = os.path.abspath(f"{workspace}/{member.name}")
+                if not member_path.startswith(workspace):
+                    raise ValueError(
+                        f"Insecure member found in tar file: {member.name}")
+                tar.extract(member, path=workspace, filter=tarfile.data_filter)
+
+        return f"{workspace}/data"
 
     def format_subject(self, subject):
         line = subject.split("_")
@@ -155,7 +205,7 @@ class MMLU(Evaluator):
         for subject in self.SUBJECT_TO_SUBCATEGORIES.keys():
             dev_df = pd.read_csv(f"{self.dataset_path}/dev/{subject}_dev.csv",
                                  header=None)
-            train_prompt = self.gen_prompt(dev_df, subject, self.num_train)
+            train_prompt = self.gen_prompt(dev_df, subject, self.num_fewshot)
 
             test_df = pd.read_csv(
                 f"{self.dataset_path}/test/{subject}_test.csv", header=None)
@@ -169,7 +219,7 @@ class MMLU(Evaluator):
                                                  include_answer=False)
                 prompt = train_prompt + prompt_end
                 label = test_df.iloc[i, test_df.shape[1] - 1]
-                yield prompt, label, subject
+                yield prompt, None, label, subject
 
     def compute_score(self, outputs: List[RequestOutput], references: List[str],
                       subjects: List[str]) -> float:
@@ -221,29 +271,69 @@ class MMLU(Evaluator):
         return weighted_acc
 
     @click.command("mmlu")
-    @click.option("--dataset_path", type=str, required=True)
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--num_train", type=int, default=5)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4094)
-    @click.option("--max_output_length", type=int, default=2)
+    @click.option(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="The path to MMLU dataset. The commands to prepare the dataset: "
+        "wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar. "
+        "If unspecified, the dataset is downloaded automatically.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--num_fewshot",
+                  type=int,
+                  default=5,
+                  help="Number of fewshot.")
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4094,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=2,
+                  help="Maximum generation length.")
+    @click.option("--check_accuracy", is_flag=True, default=False)
+    @click.option("--accuracy_threshold", type=float, default=30)
     @click.pass_context
     @staticmethod
-    def command(ctx, dataset_path: str, num_samples: int, num_train: int,
-                random_seed: int, apply_chat_template: bool,
+    def command(ctx, dataset_path: Optional[str], num_samples: int,
+                num_fewshot: int, random_seed: int, apply_chat_template: bool,
                 system_prompt: Optional[str], max_input_length: int,
-                max_output_length: int) -> None:
+                max_output_length: int, check_accuracy: bool,
+                accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)
         evaluator = MMLU(dataset_path,
                          num_samples=num_samples,
-                         num_train=num_train,
+                         num_fewshot=num_fewshot,
                          random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
-        evaluator.evaluate(llm, sampling_params)
+        accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
+
+        if check_accuracy:
+            logger.warning(
+                "The --check_accuracy flag is not expected to be used anymore. "
+                "It is being used by some legacy accuracy tests that call evaluation commands via subprocess. "
+                "New accuracy tests should use LLM API within the pytest process; please see `tests/integration/defs/accuracy/README.md`."
+            )
+            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}."

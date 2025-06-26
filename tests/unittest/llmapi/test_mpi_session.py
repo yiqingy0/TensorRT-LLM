@@ -1,5 +1,9 @@
 import os
 import subprocess  # nosec B404
+import sys
+import threading
+from subprocess import PIPE, Popen
+from typing import Literal
 
 import pytest
 
@@ -50,22 +54,45 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
-def test_remote_mpi_session():
+@pytest.mark.skip(reason="https://nvbugs/5351244")
+@pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
+def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
-    os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
-        os.getpid())
+    command = ["bash", "_test_remote_mpi_session.sh", task_type]
+    print(' '.join(command))
+    with Popen(command,
+               env=os.environ,
+               stdout=PIPE,
+               stderr=PIPE,
+               bufsize=1,
+               start_new_session=True,
+               universal_newlines=True) as process:
 
-    command = [
-        "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
-        "python3", "_run_mpi_comm_task.py"
-    ]
-    subprocess.run(command,
-                   check=True,
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   env=os.environ)  # nosec B603
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
+
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
+        return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
 
 
 def task1():

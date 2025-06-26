@@ -101,9 +101,12 @@ def smooth_qwen_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
 @torch.no_grad()
 def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
     for name, module in model.named_modules():
-        if not isinstance(module, Qwen2DecoderLayer):
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+            Qwen2VLDecoderLayer
+        if not isinstance(module, Qwen2DecoderLayer) and not isinstance(
+                module, Qwen2VLDecoderLayer):
             continue
         # qkv_proj
         layer_name_q = name + ".self_attn.q_proj"

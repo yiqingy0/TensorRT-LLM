@@ -5,6 +5,7 @@ import sys
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
@@ -13,8 +14,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (PeftCacheConfig,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.bindings.internal.batch_manager import (
-    PeftTaskNotCachedException, RequestVector)
+from tensorrt_llm.bindings.internal.batch_manager import \
+    PeftTaskNotCachedException
 
 LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
@@ -38,9 +39,6 @@ class TestResourceManager(unittest.TestCase):
         """
         Setup the lora test data resources
         """
-        # TODO smor- this should be ported to a different place, ideally run once
-        # in a similar way to the cpp tests fixutres.
-
         cpp_script_dir = os.path.join(cls.CPP_RESOURCES_DIR, "scripts")
 
         generate_lora_data_args_tp1 = [
@@ -258,7 +256,6 @@ class TestResourceManager(unittest.TestCase):
         Returns:
             tuple: (weights tensor, config tensor) formatted correctly for the C++ implementation.
         """
-        # TODO smor- change from custom path configuration to relative path
         lora_weights = np.load(self.TP1_WEIGHTS_PATH).astype(np.float16)
         lora_weights = np.expand_dims(lora_weights, axis=0)
         lora_config = np.load(self.TP1_CONFIG_PATH)
@@ -303,8 +300,8 @@ class TestResourceManager(unittest.TestCase):
             model_config=self.model_config,
         )
 
-        empty_context = RequestVector()
-        empty_generation = RequestVector()
+        empty_context = []
+        empty_generation = []
         expected_empty_table = peft_cache_manager.ensure_batch(
             empty_context, empty_generation)
         self.assertEqual(expected_empty_table, {})
@@ -328,9 +325,9 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager.add_request_peft(lora_request)
 
-        context_batch = RequestVector()
+        context_batch = []
         context_batch.append(lora_request)
-        generation_batch = RequestVector()
+        generation_batch = []
 
         result = peft_cache_manager.ensure_batch(context_batch,
                                                  generation_batch)
@@ -342,6 +339,7 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertEqual(len(peft_table), self.num_lora_modules)
 
+    @pytest.mark.skip(reason="https://nvbugs/5324252")
     def test_put_get(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()
@@ -364,9 +362,9 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager.add_request_peft(lora_request)
 
-        context_batch = RequestVector()
+        context_batch = []
         context_batch.append(lora_request)
-        generation_batch = RequestVector()
+        generation_batch = []
 
         result = peft_cache_manager.ensure_batch(context_batch,
                                                  generation_batch)
@@ -410,11 +408,11 @@ class TestResourceManager(unittest.TestCase):
         self.assertEqual(len(peft_table), len(expected_values))
 
         for i, entry in enumerate(peft_table):
-            self.assertEqual(entry.pageId, expected_values[i][0])
-            self.assertEqual(entry.slotIdx, expected_values[i][1])
-            self.assertEqual(entry.inSize, expected_values[i][2])
-            self.assertEqual(entry.outSize, expected_values[i][3])
-            self.assertEqual(entry.moduleId, expected_values[i][4])
-            self.assertEqual(entry.layerId, expected_values[i][5])
-            self.assertEqual(entry.adapterSize, expected_values[i][6])
-            self.assertEqual(entry.numSlots, expected_values[i][7])
+            self.assertEqual(entry.page_id, expected_values[i][0])
+            self.assertEqual(entry.slot_idx, expected_values[i][1])
+            self.assertEqual(entry.in_size, expected_values[i][2])
+            self.assertEqual(entry.out_size, expected_values[i][3])
+            self.assertEqual(entry.module_id, expected_values[i][4])
+            self.assertEqual(entry.layer_id, expected_values[i][5])
+            self.assertEqual(entry.adapter_size, expected_values[i][6])
+            self.assertEqual(entry.num_slots, expected_values[i][7])

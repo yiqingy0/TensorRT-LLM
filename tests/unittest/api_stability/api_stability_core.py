@@ -3,7 +3,7 @@ import copy
 import inspect
 import os
 import pathlib
-from dataclasses import dataclass, fields
+from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from types import MethodType, NoneType
 from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
                     Sequence, Tuple, Union, _type_repr)
@@ -17,8 +17,10 @@ import yaml
 from pydantic import BaseModel
 
 import tensorrt_llm
+from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
+from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
@@ -118,7 +120,8 @@ class ParamSnapshot:
     def assert_equal(self, other: 'ParamSnapshot'):
         qual_name = StackTrace().get_qual_name()
         assert self.annotation == other.annotation, f"{qual_name} annotation: {self.annotation} != {other.annotation}"
-        assert self.default == other.default, f"{qual_name} default: {self.default} != {other.default}"
+        if not isinstance(self.default, _HAS_DEFAULT_FACTORY_CLASS):
+            assert self.default == other.default, f"{qual_name} default: {self.default} != {other.default}"
 
 
 @dataclass(slots=True)
@@ -364,8 +367,14 @@ class ClassSnapshot:
         if self.properties.keys() != other.properties.keys():
             diff_keys = set(self.properties.keys()) ^ set(
                 other.properties.keys())
+            this_diff_keys = set(self.properties.keys()) - set(
+                other.properties.keys())
+            other_diff_keys = set(other.properties.keys()) - set(
+                self.properties.keys())
             raise AssertionError(
-                f"{qual_name} has different properties: {diff_keys}")
+                f"{qual_name} has different properties: {diff_keys}\n"
+                f"This class has extra properties: {this_diff_keys}\n"
+                f"The reference has extra properties: {other_diff_keys}")
 
         for name, prop in self.properties.items():
             with StackTrace().push(name):

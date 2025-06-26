@@ -124,6 +124,9 @@ public:
         int32_t num_encoder_tokens = 0;
         kernels::MlaParams<T>* mla_param = nullptr;
 
+        // For MLA chunked prefill
+        void* softmaxStatsPtr = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -173,6 +176,7 @@ public:
             ss << "cross_kv_length: " << this->cross_kv_length << std::endl;
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
+            ss << "softmaxStatsPtr: " << this->softmaxStatsPtr << std::endl;
             return ss.str();
         }
     };
@@ -322,6 +326,12 @@ public:
         return mSM;
     }
 
+    [[nodiscard]] bool supportsNvFp4Output() const
+    {
+        bool needsUlyssesPostprocess = mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1;
+        return mEnableContextFMHA && mEnableXQA && !needsUlyssesPostprocess;
+    }
+
     [[nodiscard]] int32_t* multiBlockSemaphores() const
     {
         return mMultiBlockSemaphores.get();
@@ -379,7 +389,8 @@ public:
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
-    bool mUseFlashMLA = false;
+    bool mIsGenerationMLA = false;
+    bool mUseGenFlashMLA = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
@@ -411,6 +422,9 @@ public:
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
 
+    // See [Chunked Attention] in _torch/modules/attention.py
+    std::optional<int64_t> mAttentionChunkSize = std::nullopt;
+
     [[nodiscard]] auto data() const
     {
         return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
@@ -422,10 +436,11 @@ public:
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mUseFlashMLA, mMLAParams.data(), mCpSize, mCpRank,
-            mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize,
-            mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA,
-            mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
+            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
+            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
+            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores,
+            mAttentionChunkSize.value_or(-1));
     };
 
 private:

@@ -18,6 +18,7 @@ import os
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
+from defs.conftest import get_gpu_device_list
 from defs.trt_test_alternative import check_call
 
 
@@ -30,6 +31,9 @@ def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
                                              llm_venv, cmodel_dir, engine_dir,
                                              use_weight_only):
     "Build & run commandr_v01 on single gpu."
+    if "GH200" in get_gpu_device_list()[0] and not use_weight_only:
+        pytest.skip("OOM on GH200. https://nvbugs/5250460")
+
     print("Converting checkpoint...")
     dtype = 'float16'
     model_name = os.path.basename(llm_commandr_v01_model_root)
@@ -56,7 +60,7 @@ def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{commandr_example_root}/../summarize.py",
+        f"{commandr_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llm_commandr_v01_model_root}",
@@ -111,7 +115,7 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
     ]
 
     run_cmd = [
-        f"{commandr_example_root}/../run.py",
+        f"{commandr_example_root}/../../../run.py",
         f"--max_output_len={50}",
         f"--tokenizer_dir={llm_commandr_plus_model_root}",
         f"--engine_dir={engine_dir}",

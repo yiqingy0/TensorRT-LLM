@@ -201,6 +201,16 @@ def test_llm_medusa_fp8_modelOpt_ckpt_1gpu(batch_size, medusa_model_roots,
 def test_with_dummy_medusa(hf_model_root, medusa_example_root, llm_venv,
                            cmodel_dir, engine_dir, batch_size, data_type,
                            num_medusa_heads, use_py_session, model_type):
+
+    # We unset WORLD_SIZE while running tests in specific cluster nodes to
+    # deal with a bug in transformers library. Trainer initialization in
+    # get_dummy_spec_decoding_heads() function fails if WORLD_SIZE is unset.
+    # Preemptively skip tests if WORLD_SIZE is unset.
+    if os.environ.get("WORLD_SIZE") is None:
+        pytest.skip(
+            "[test_with_dummy_medusa] Skipping test due to missing WORLD_SIZE env variable."
+        )
+
     print("Creating dummy Medusa heads...")
     get_dummy_spec_decoding_heads(hf_model_dir=hf_model_root,
                                   save_dir=llm_venv.get_working_directory(),
@@ -252,6 +262,7 @@ def test_with_dummy_medusa(hf_model_root, medusa_example_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5219534")
 @pytest.mark.parametrize("llama_model_root",
                          ['llama-v2-7b-hf', 'llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
@@ -279,6 +290,7 @@ def test_llama_medusa_1gpu(llama_model_root,
                            model_type='llama')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5219534")
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
                          indirect=True)
 def test_codellama_medusa_1gpu(code_llama_model_root,

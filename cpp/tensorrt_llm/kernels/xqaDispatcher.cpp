@@ -91,17 +91,18 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens)
     // output conversion.
     workspace_size = roundUp<size_t>(
         workspace_size + kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens, 128);
+    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * max_num_tokens;
     if (mFixedParams.multiBlockMode)
     {
-        int workspaces[4];
-        uint32_t const nbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
-        uint32_t const nbSeq = nbSubSeq / 2;
+        size_t workspaces[4];
+        size_t const nbSubSeq = getXqaMaxNumSubSeq(mFixedParams.isMLA);
+        size_t const nbSeq = nbSubSeq / 2;
         int group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
         workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
         workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
-        int32_t const multi_block_workspace_alignment
-            = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
+        size_t const multi_block_workspace_alignment
+            = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
         workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
         workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
             + roundUp(workspaces[0], multi_block_workspace_alignment)
@@ -197,6 +198,10 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
@@ -225,6 +230,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");
+        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
 
         int num_q_heads = params.num_q_heads;
         int num_kv_heads = params.num_kv_heads;
@@ -265,9 +271,12 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the params.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
         float const* rotary_inv_freq_buf = params.rotary_embedding_inv_freq_cache;
+        // Use the nullptr for cu_seqlens when it is not computed.
+        int const* cu_seqlens{nullptr};
         if (decoder_params.isBuildDecoderInfoKernelNeeded())
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
+            cu_seqlens = launchParams.cu_seq_lens;
             invokeBuildDecoderInfo(decoder_params, params.stream);
             sync_check_cuda_error(params.stream);
         }
@@ -301,7 +310,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         preprocessingParms.logn_scaling = params.logn_scaling_ptr;
         preprocessingParms.seq_lens = params.spec_decoding_generation_lengths;
         preprocessingParms.cache_seq_lens = params.sequence_lengths;
-        preprocessingParms.cu_seq_lens = params.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
+        preprocessingParms.cu_seq_lens = cu_seqlens;
         preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
         preprocessingParms.kvScaleOrigQuant = params.kv_scale_orig_quant;
@@ -376,6 +385,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.multiCtasKvCounterPtr = launchParams.semaphores;
         tllmRunnerParams.multiCtasKvScratchPtr = launchParams.scratch;
 
+        tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
         // TRTLLM-GEN kernels always use the Log2 scale
@@ -395,26 +405,23 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mBatchSize = params.batch_size;
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
-        tllmRunnerParams.mMaxSeqLenQ = 1;
-        tllmRunnerParams.mMaxSeqLenKv = std::min(params.cyclic_attention_window_size, params.max_past_kv_length);
+        tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
+        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
+        // The sliding window attention size.
+        tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
+        // The chunked attention size.
+        // The generation-phase chunked attention is disabled for now.
+        tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenKv);
         tllmRunnerParams.mScaleQ = params.q_scaling;
-        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-        {
-            auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
-            // The kv cache should be based on the maximum headDim of K and V due to paddings.
-            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = totalMemory
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
-                    * get_size_in_bytes(mFixedParams.kvDataType));
-        }
+        // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
+        tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
 
-        TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else
