@@ -366,7 +366,7 @@ def launchReleaseCheck(pipeline)
             }
         }
         // Step 3: Run license check
-        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm")
 
         // Step 4: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
