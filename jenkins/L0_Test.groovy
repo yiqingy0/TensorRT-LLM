@@ -1263,6 +1263,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
 
+        // download waives.txt
+        def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
+        try {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+            if (fileExists("waives.txt")) {
+                sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+                sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+            }
+            echo "Download merged waives.txt successfully"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
+        }
+
         // install python package
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -1358,7 +1373,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
         def extraInternalEnv = ""
-        def pytestTestTimeout = "1800"
+        def pytestTestTimeout = "3600"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -1559,7 +1574,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -1824,7 +1839,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 1, 8, 2],
+        // Each stage test 1 testcase with 8 GPUs and 2 nodes.
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -1882,7 +1901,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     // Python version and OS for sanity check
-    sanityCheckConfigs = [
+    x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
@@ -1912,31 +1931,35 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         ],
     ]
 
-    if (env.targetArch == AARCH64_TRIPLE) {
-        sanityCheckConfigs = [
-            "PY312-UB2404": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "",
-                UBUNTU_24_04_IMAGE,
-                true, // Extra PyTorch CUDA 12.8 install
-            ],
-            "PY312-DLFW": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "dlfw/",
-                DLFW_IMAGE,
-                false,
-            ],
-        ]
-    }
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "",
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 12.8 install
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "dlfw/",
+            DLFW_IMAGE,
+            false,
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
-    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += aarch64SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+
+    sanityCheckConfigs = x86SanityCheckConfigs
+    if (env.targetArch == AARCH64_TRIPLE) {
+        sanityCheckConfigs = aarch64SanityCheckConfigs
+    }
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -2212,6 +2235,7 @@ pipeline {
         //Workspace normally is: /home/jenkins/agent/workspace/LLM/L0_MergeRequest@tmp/
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
+        GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1

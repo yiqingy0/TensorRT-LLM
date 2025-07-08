@@ -26,18 +26,23 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
-// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
-// [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506271620-5539"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506271620-5539"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202506271620-5539"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202506271620-5539"
-
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "48Gi"
+def getContainerURIs()
+{
+    // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+    // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
+    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    uris = [:]
+    keys = [
+        "LLM_DOCKER_IMAGE",
+        "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+    ]
+    for (key in keys) {
+        uris[key] = tagProps[key]
+    }
+    return uris
+}
 
 // Stage choices
 STAGE_CHOICE_NORMAL = "normal"
@@ -134,10 +139,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def TARGET_BRANCH = "target_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -203,34 +211,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['cat']
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
@@ -243,11 +229,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -288,11 +274,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -315,25 +301,163 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
-    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
-        sh "env | sort"
-        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-        echo "Using GitLab repo: ${LLM_REPO}."
-        sh "git config --global --add safe.directory \"*\""
-        if (env.gitlabMergeRequestLastCommit) {
-            env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        } else {
-            branch = env.gitlabBranch ? env.gitlabBranch : "main"
-            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-            env.gitlabCommit = checkoutCommit
+    sh "env | sort"
+    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    echo "Using GitLab repo: ${LLM_REPO}."
+    sh "git config --global --add safe.directory \"*\""
+    // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
+    if (env.gitlabMergeRequestLastCommit) {
+        env.gitlabCommit = env.gitlabMergeRequestLastCommit
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    } else {
+        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        env.gitlabCommit = checkoutCommit
+    }
+    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    getContainerURIs().each { k, v ->
+        globalVars[k] = v
+    }
+}
+
+def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+            usernameVariable: 'GITLAB_API_USER',
+            passwordVariable: 'GITLAB_API_TOKEN'
+        ),
+        string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+    ]) {
+        def diff = ""
+        def pageId = 0
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            def found = rawDataList.find { rawData ->
+                if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                    diff = rawData.get("diff")
+                    return true
+                }
+                return false
+            }
+            if (!rawDataList || diff != "") { break }
         }
-        echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
-        echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        pipeline.echo("The change of ${filePath} is: ${diff}")
+        return diff
+    }
+}
+
+def getMergeRequestOneFileChangesGithub(pipeline, githubPrApiUrl, filePath) {
+    def diff = ""
+    def pageId = 0
+    withCredentials([
+        string(
+            credentialsId: 'github-token-trtllm-ci',
+            variable: 'GITHUB_API_TOKEN'
+        ),
+    ]) {
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                         --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            echo "rawDataJson: ${rawDataJson}"
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            def found = rawDataList.find { rawData ->
+                if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                    diff = rawData.get("patch")
+                    return true
+                }
+                return false
+            }
+            if (!rawDataList || diff != "") { break }
+        }
+    }
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
+}
+
+def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set waive list diff to empty.")
+        return ""
+    }
+
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    def diff = ""
+
+    try {
+        if (githubPrApiUrl != null) {
+            diff = getMergeRequestOneFileChangesGithub(pipeline, githubPrApiUrl, filePath)
+        } else {
+            diff = getMergeRequestOneFileChangesGitlab(pipeline, filePath)
+        }
+        return diff
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
+        return ""
+    }
+}
+
+def mergeWaiveList(pipeline, globalVars)
+{
+    sh "git config --global --add safe.directory \"*\""
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabMergeRequestLastCommit, LLM_ROOT, true, true)
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabMergeRequestLastCommit}.txt"
+    sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_ROOT, true, true)
+    targetBranchTOTCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+    // sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+
+    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+    sh """
+        python3 mergeWaiveList.py \
+        --cur-waive-list=waives_CUR_${env.gitlabMergeRequestLastCommit}.txt \
+        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+        --diff='${diff}' \
+        --output-file=waives.txt
+    """
+    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+    echo "Waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/"
+}
+
+def preparation(pipeline, testFilter, globalVars)
+{
+    image = "urm.nvidia.com/docker/golang:1.22"
+    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
+        stage("Setup environment") {
+            setupPipelineEnvironment(pipeline, testFilter, globalVars)
+        }
+        stage("Merge Waive List") {
+            mergeWaiveList(pipeline, globalVars)
+        }
     })
 }
 
@@ -396,7 +520,7 @@ def launchReleaseCheck(pipeline)
 
     def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -569,8 +693,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/executor/executorImpl.cpp",
         "cpp/tensorrt_llm/executor/executorImpl.h",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.h",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.cu",
+        "cpp/tensorrt_llm/kernels/communicationKernels/",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
@@ -865,9 +989,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        'dockerImage': LLM_DOCKER_IMAGE,
-                        'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                        'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         'globalVars': globalVarsJson,
                     ]
 
@@ -900,15 +1024,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            'dockerImage': LLM_DOCKER_IMAGE,
-                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                             'globalVars': globalVarsJson,
                         ]
 
@@ -965,7 +1088,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         'globalVars': globalVarsJson,
                     ]
 
@@ -999,13 +1122,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         def parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                             'globalVars': globalVarsJson,
                         ]
 
@@ -1139,12 +1261,12 @@ pipeline {
         }
     }
     stages {
-        stage("Setup environment")
+        stage("Preparation")
         {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, globalVars)
+                    preparation(this, testFilter, globalVars)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"

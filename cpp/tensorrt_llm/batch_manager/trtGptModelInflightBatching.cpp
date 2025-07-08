@@ -567,7 +567,7 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
     TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
         common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
     setMaxAttentionWindowVec(newMaxAttentionWindowVec);
-    if (getMaxSequenceLen() < getMaxAttentionWindow())
+    if (getMaxSequenceLen() > getMaxAttentionWindow())
     {
         TLLM_LOG_WARNING("maxSequenceLen is reduced to maxAttentionWindow: %d", getMaxAttentionWindow());
         setMaxSequenceLen(getMaxAttentionWindow());
@@ -1024,6 +1024,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 prepareDistGenBufferAndDecoder(currRequests.generationRequests);
             }
+            sync_check_cuda_error(mRuntime->getStream().get());
 
             executeBatch(currRequests);
             if (mWorldConfig.isLastPipelineParallelRank() && mGuidedDecoder)
@@ -1062,6 +1063,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             decoderFinishedEvent = mWorldConfig.isLastPipelineParallelRank()
                 ? std::make_optional(decoderStepAsync(currRequests))
                 : std::nullopt;
+
+            sync_check_cuda_error(mRuntime->getStream().get());
 
             mLastIterationStatsIFB = fillIterationStats(currRequests, requestsToPause);
             for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
@@ -1840,40 +1843,6 @@ void TrtGptModelInflightBatching::postProcessRequest(
             genRuntimeBuffers.generationLogitsCache, bufferManager, llmReq, beforeDecoder, numDroppedTokens);
 
         bufferManager.getStream().synchronize();
-    }
-
-    if (mWorldConfig.isPipelineParallel())
-    {
-        // Send context logits from last to first PP rank
-        if (llmReq.getReturnContextLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getContextLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-        }
-
-        // Send generation logits from last to first PP rank
-        if (llmReq.getReturnGenerationLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getGenerationLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getGenerationLogitsHost()),
-                    mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-        }
     }
 
     if (reqBeamWidth == 1)

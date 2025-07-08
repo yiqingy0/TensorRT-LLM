@@ -48,7 +48,7 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    mixed_sampler: bool = False
+    enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
@@ -90,6 +90,8 @@ class PyTorchConfig:
     # The iteration interval to create responses under the streaming mode.
     # TODO: make this a per-request parameter
     stream_interval: int = 1
+
+    force_dynamic_quantization: bool = False
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [

@@ -73,7 +73,6 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
 
     auto& dInput = mJointDecodingInput;
     TLLM_CHECK(static_cast<bool>(dInput));
-    dInput->logits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dInput->endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dInput->batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
 
@@ -643,6 +642,16 @@ TensorPtr DecoderState::getCacheIndirectionInput() const
 TensorPtr DecoderState::getCacheIndirectionOutput() const
 {
     return mJointDecodingOutput->cacheIndirection;
+}
+
+std::optional<std::vector<SizeType32>> const& DecoderState::getGenerationSteps() const
+{
+    return mJointDecodingInput->generationSteps;
+}
+
+void DecoderState::setGenerationSteps(std::vector<SizeType32> const& generationSteps)
+{
+    mJointDecodingInput->generationSteps = generationSteps;
 }
 
 DecodingInput& DecoderState::getJointDecodingInput() const
