@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -219,6 +220,7 @@ class ADEngine(ModelEngine):
         resource_manager: ResourceManager,
         new_tokens_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
@@ -255,10 +257,12 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     msg = "pytorch_backend_config must be an AD LlmArgs object"
     assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
     ad_config: LlmArgs = executor_config.pytorch_backend_config
+    assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
+    max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     # some derivative properties
-    max_draft_tokens = (
-        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    max_draft_len = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
 
     # initialize model engine
@@ -272,7 +276,13 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=ad_config.max_seq_len,
         max_batch_size=ad_config.max_batch_size,
     )
-    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+        }
+    )
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
@@ -283,14 +293,18 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require mixed_sampler=True to have good outputs, see
+    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
     # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
     # We should expose mixed_sample to our build_and_run_ad script so we can configure this
     # correctly for models as needed.
-    sampler = TorchSampler(
+    sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
-        mixed_sampler=ad_config.mixed_sampler,
+        max_draft_len=max_draft_len,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=executor_config.max_beam_width,
+        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
+    sampler = TorchSampler(sampler_args)
 
     # creating the executor object
     py_executor = PyExecutor(
@@ -299,9 +313,11 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
+        max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
+        max_beam_width=ad_config.max_beam_width,
     )
     return py_executor

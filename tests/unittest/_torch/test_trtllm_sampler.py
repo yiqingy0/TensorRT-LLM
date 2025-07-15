@@ -41,6 +41,7 @@ def create_llm(model_dir):
     )
 
 
+@pytest.mark.high_cuda_memory
 def test_trtllm_sampler(model_path, test_case):
     prompts = [
         "Magellan and Elcano lead the first",
@@ -78,4 +79,4 @@ def test_trtllm_sampler(model_path, test_case):
 
     # Verify outputs are consistent
     for text, expected in zip(texts, expected_outputs):
-        assert similar(text, expected)
+        assert similar(text, expected), f"text: {text}, expected: {expected}"

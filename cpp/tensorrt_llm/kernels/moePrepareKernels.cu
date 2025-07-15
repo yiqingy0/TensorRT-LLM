@@ -461,7 +461,6 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                 {
                     int tokenId = *(localSendIndice + maxTokenCountPerRank * targetRankId + (index / groupSize));
                     *((int4*) (experts)) = *(int4*) (sendExperts + tokenId * topK + groupId * UNIT_SIZE);
-                    *((float4*) (scales)) = *(float4*) (sendScales + tokenId * topK + groupId * UNIT_SIZE);
 
 #pragma unroll
                     for (int j = 0; j < UNIT_SIZE; j++)
@@ -470,15 +469,18 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                         if (expertId / slotCountPerRank != targetRankId)
                         {
                             experts[j] = slotCount;
-                            scales[j] = 0.0f;
                         }
                     }
 
                     int* expertsPtr = (int*) (packPtr) + threadIdx.x * UNIT_SIZE;
-                    float* scaleBasePtr = (float*) (packPtr + SCALE_OFFSET);
-                    float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * UNIT_SIZE;
                     *((int4*) (expertsPtr)) = *((int4*) (experts));
-                    *((float4*) (scalesPtr)) = *((float4*) (scales));
+                    if (sendScales != nullptr)
+                    {
+                        *((float4*) (scales)) = *(float4*) (sendScales + tokenId * topK + groupId * UNIT_SIZE);
+                        float* scaleBasePtr = (float*) (packPtr + SCALE_OFFSET);
+                        float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * UNIT_SIZE;
+                        *((float4*) (scalesPtr)) = *((float4*) (scales));
+                    }
                 }
             }
             else if (localExpertStatics != nullptr)
@@ -518,18 +520,20 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
             {
                 if (threadIdx.x < packetUnitCount)
                 {
-                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * UNIT_SIZE;
-                    float* scaleBasePtr = (float*) (packetPtr + SCALE_OFFSET);
-                    float* scalesPtr = scaleBasePtr + threadIdx.x * UNIT_SIZE;
-                    *((int4*) (experts)) = *((int4*) (expertsPtr));
-                    *((float4*) (scales)) = *((float4*) (scalesPtr));
-
                     int tokenId = baseCumsum + (unitIdBase + threadIdx.x) / groupSize;
-
+                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * UNIT_SIZE;
+                    *((int4*) (experts)) = *((int4*) (expertsPtr));
                     int4* dstExpertsPtr = (int4*) (recvExperts + tokenId * topK + groupId * UNIT_SIZE);
-                    float4* dstScalesPtr = (float4*) (recvScales + tokenId * topK + groupId * UNIT_SIZE);
                     *dstExpertsPtr = *((int4*) (experts));
-                    *dstScalesPtr = *((float4*) (scales));
+
+                    if (recvScales != nullptr)
+                    {
+                        float* scaleBasePtr = (float*) (packetPtr + SCALE_OFFSET);
+                        float* scalesPtr = scaleBasePtr + threadIdx.x * UNIT_SIZE;
+                        *((float4*) (scales)) = *((float4*) (scalesPtr));
+                        float4* dstScalesPtr = (float4*) (recvScales + tokenId * topK + groupId * UNIT_SIZE);
+                        *dstScalesPtr = *((float4*) (scales));
+                    }
                 }
             }
             else if (localExpertStatics != nullptr)
@@ -549,6 +553,18 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
         }
 
         pipeline.reset();
+    }
+}
+
+__global__ void memsetExpertIdsDevice(
+    int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount, int rankCount)
+{
+    int maxTokenCount = maxTokenCountPerRank * rankCount;
+    int totalRecvTokenCount = *(recvCountsCumsum + rankCount - 1);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i + totalRecvTokenCount * topK < maxTokenCount * topK;
+         i += gridDim.x * blockDim.x)
+    {
+        *(expertIds + i + totalRecvTokenCount * topK) = slotCount;
     }
 }
 
@@ -613,11 +629,15 @@ void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, flo
     int block_size = localExpertStatics == nullptr ? UNIT_PER_ITER : UNIT_PER_ITER + STATIC_COPY_PER_ITER;
     dim3 block(block_size);
     dim3 grid(rankCount, 2);
-    assert(topK == 8);
+
     allToAllMetadataDevice<StepCommunicatorBase><<<grid, block, 0, stream>>>(sendExperts, recvExperts, sendScales,
         recvScales, localExpertStatics, gatheredExpertStatics, workspace, sendCountsCumsum, localSendIndice,
         recvCountsCumsum, localRecvIndice, tokenCount, maxTokenCountPerRank, topK, expertCount, slotCount, rankId,
         rankCount);
+
+    int smCount = tensorrt_llm::common::getMultiProcessorCount();
+    memsetExpertIdsDevice<<<smCount, 256, 0, stream>>>(
+        recvExperts, recvCountsCumsum, maxTokenCountPerRank, topK, slotCount, rankCount);
 }
 
 size_t getMoePrepareWorkspaceSize(int epSize)
