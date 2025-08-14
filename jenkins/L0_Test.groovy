@@ -1085,7 +1085,7 @@ def reusePassedTests(pipeline, llmSrc, reusedArtifactPath, stageName, testListFi
             --input-file=${reusedPath}/${stageName}/results.xml \
             --output-file=${passedTestsFile}
         """
-        sh "The passed tests are: $(cat ${passedTestsFile})"
+        sh "The passed tests are: \$(cat ${passedTestsFile})"
 
         // Copy the original test file to a new file
         sh "cp ${testListFile} original_${testListFile}"
@@ -1096,7 +1096,7 @@ def reusePassedTests(pipeline, llmSrc, reusedArtifactPath, stageName, testListFi
             --input-file=${testListFile} \
             --passed-tests-file=${passedTestsFile}
         """
-        sh "The test list after removing passed tests is: $(cat ${testListFile})"
+        sh "The test list after removing passed tests is: \$(cat ${testListFile})"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
