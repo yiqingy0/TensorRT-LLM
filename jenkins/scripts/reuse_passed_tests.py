@@ -1,8 +1,10 @@
+import argparse
 import os
 import sys
-import argparse
 import xml.etree.ElementTree as ET
-from test_rerun import parse_name
+
+import test_rerun
+
 
 def get_passed_tests(input_file, output_file):
     if not os.path.exists(input_file):
@@ -25,8 +27,8 @@ def get_passed_tests(input_file, output_file):
                 classname = testcase.attrib.get('classname', '')
                 name = testcase.attrib.get('name', '')
                 filename = testcase.attrib.get('file', '')
-                testName = parse_name(classname, name, filename)
-                passed_tests.append(testName)
+                test_name = test_rerun.parse_name(classname, name, filename)
+                passed_tests.append(test_name)
     except Exception as e:
         print(f"Failed to parse {input_file}: {e}")
         return

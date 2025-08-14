@@ -25,7 +25,7 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
-REUSE_ARITIFACT_PATH = env.reuseArtifactPath
+REUSE_ARTIFACT_PATH = env.reuseArtifactPath
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -352,8 +352,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPath = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
                 // Reuse passed tests
-                if (REUSE_ARITIFACT_PATH) {
-                    reusePassedTests(REUSE_ARITIFACT_PATH, stageName, testListPath)
+                if (REUSE_ARTIFACT_PATH) {
+                    reusePassedTests(pipeline, llmSrcLocal, REUSE_ARTIFACT_PATH, stageName, testListPath)
                 }
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}",)
 
@@ -1069,13 +1069,14 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     return testList
 }
 
-def reusePassedTests(reusedArtifactPath, stageName, testListFile) {
+def reusePassedTests(pipeline, llmSrc, reusedArtifactPath, stageName, testListFile) {
     def reusedPath = "${WORKSPACE}/reused"
     sh "mkdir -p ${reusedPath}"
     def resultsFileName = "results-${stageName}"
     def passedTestsFile = "${reusedPath}/${stageName}/passed_tests.txt"
     try {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${reusedPath} && wget -nv ${reusedArtifactPath}/test-results/${resultsFileName}.tar.gz")
+        def resultsUrl = "https://urm.nvidia.com/artifactory/${reusedArtifactPath}/test-results/${resultsFileName}.tar.gz"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${reusedPath} && wget -nv ${resultsUrl}")
         sh "cd ${reusedPath} && tar -zxf ${resultsFileName}.tar.gz"
         // Get passed tests
         sh """
@@ -1450,8 +1451,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         // Reuse passed tests
-        if (REUSE_ARITIFACT_PATH) {
-            reusePassedTests(REUSE_ARITIFACT_PATH, stageName, testDBList)
+        if (REUSE_ARTIFACT_PATH) {
+            reusePassedTests(pipeline, llmSrc, REUSE_ARTIFACT_PATH, stageName, testDBList)
         }
 
         testList = "${testList}_${splitId}"
