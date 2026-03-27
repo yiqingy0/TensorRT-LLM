@@ -1476,6 +1476,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
+    pytest.fail("test_openai_chat_example")
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
